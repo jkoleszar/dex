@@ -11,6 +11,7 @@ capnp = "0.16.0"
 clap = { version = "4.1.8", features = ["derive"] }
 ring = { version = "0.16.20", features = ["std"] }
 rusqlite = { version = "0.28.0", features = ["bundled"] }
+thiserror = "1.0.39"
 
 [build-dependencies]
 capnpc = "0.16.3"

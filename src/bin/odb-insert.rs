@@ -4,9 +4,8 @@ use std::io::Read;
 use anyhow::Result;
 use capnp::Word;
 use clap::Parser;
-use ring::digest::{digest, SHA512_256};
-use rusqlite::Connection;
 
+use dex::odb::ObjectDb;
 use dex::proto::odb_capnp::chunk;
 
 /// Import files into the object store
@@ -35,25 +34,9 @@ fn main() -> Result<()> {
     file.read(data)?;
     let serialized = message.into_reader().canonicalize()?;
 
-    let hash = format!(
-        "{:x?}",
-        digest(&SHA512_256, Word::words_to_bytes(&serialized))
-    );
-
     // Write the chunk to the database.
-    let db = Connection::open(&args.db)?;
-    db.execute(
-        "CREATE TABLE IF NOT EXISTS chunks (
-            id   TEXT PRIMARY KEY,
-            data BLOB
-        )",
-        (), // empty list of parameters.
-    )?;
-    db.execute(
-        "INSERT OR IGNORE INTO chunks (id, data) VALUES (?1, ?2)",
-        (&hash, Word::words_to_bytes(&serialized)),
-    )?;
-
+    let db = ObjectDb::new(&args.db)?;
+    let hash = db.insert_chunk(Word::words_to_bytes(&serialized))?;
     println!("{hash}");
     Ok(())
 }
