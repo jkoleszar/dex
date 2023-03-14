@@ -1,8 +1,9 @@
 use std::fmt::{Debug, Display, Formatter};
 use std::path::Path;
 
+use hex;
 use ring::digest::{digest, SHA512_256};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use thiserror::Error;
 
 #[derive(Copy, Clone, Debug)]
@@ -21,11 +22,24 @@ impl Display for ObjectId {
         Ok(())
     }
 }
+impl ObjectId {
+    pub fn parse(s: &str) -> Result<ObjectId, hex::FromHexError> {
+        let mut encoded = [0;32];
+        hex::decode_to_slice(s, &mut encoded)?;
+        Ok(ObjectId::SHA512_256(encoded))
+    }
+    pub fn to_string(&self) -> String {
+        format!("{self}")
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("database error")]
     DbError(#[from] rusqlite::Error),
+
+    #[error("object {0} not found")]
+    Missing(ObjectId),
 }
 
 pub struct ObjectDb {
@@ -53,5 +67,13 @@ impl ObjectDb {
             (&id, data),
         )?;
         Ok(ObjectId::SHA512_256(hash.as_ref().try_into().unwrap()))
+    }
+
+    pub fn get_chunk_encoded(&self, key: &ObjectId) -> Result<Vec<u8>, Error> {
+        self.conn.query_row(
+            "SELECT data FROM chunks WHERE id=(?)",
+            [key.to_string()],
+            |row| row.get(0),
+        ).optional()?.ok_or(Error::Missing(*key))
     }
 }

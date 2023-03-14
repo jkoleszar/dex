@@ -9,6 +9,7 @@ edition = "2021"
 anyhow = "1.0.69"
 capnp = "0.16.0"
 clap = { version = "4.1.8", features = ["derive"] }
+hex = "0.4.3"
 ring = { version = "0.16.20", features = ["std"] }
 rusqlite = { version = "0.28.0", features = ["bundled"] }
 thiserror = "1.0.39"
