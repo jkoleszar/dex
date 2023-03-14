@@ -8,7 +8,7 @@ use thiserror::Error;
 
 #[derive(Copy, Clone, Debug)]
 pub enum ObjectId {
-    SHA512_256([u8;32])
+    SHA512_256([u8; 32]),
 }
 impl Display for ObjectId {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
@@ -24,7 +24,7 @@ impl Display for ObjectId {
 }
 impl ObjectId {
     pub fn parse(s: &str) -> Result<ObjectId, hex::FromHexError> {
-        let mut encoded = [0;32];
+        let mut encoded = [0; 32];
         hex::decode_to_slice(s, &mut encoded)?;
         Ok(ObjectId::SHA512_256(encoded))
     }
@@ -61,7 +61,7 @@ impl ObjectDb {
 
     pub fn insert_chunk(&self, data: &[u8]) -> Result<ObjectId, Error> {
         let hash = digest(&SHA512_256, data);
-        let id = format!("{:x?}", hash);
+        let id = format!("{hash:x?}");
         self.conn.execute(
             "INSERT OR IGNORE INTO chunks (id, data) VALUES (?1, ?2)",
             (&id, data),
@@ -70,10 +70,13 @@ impl ObjectDb {
     }
 
     pub fn get_chunk_encoded(&self, key: &ObjectId) -> Result<Vec<u8>, Error> {
-        self.conn.query_row(
-            "SELECT data FROM chunks WHERE id=(?)",
-            [key.to_string()],
-            |row| row.get(0),
-        ).optional()?.ok_or(Error::Missing(*key))
+        self.conn
+            .query_row(
+                "SELECT data FROM chunks WHERE id=(?)",
+                [key.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(Error::Missing(*key))
     }
 }
