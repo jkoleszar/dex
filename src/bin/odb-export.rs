@@ -3,6 +3,7 @@ use std::io::Write;
 
 use anyhow::Result;
 use clap::Parser;
+use rusqlite::Connection;
 
 use dex::odb::{ObjectDb, ObjectId};
 
@@ -21,7 +22,8 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let db = ObjectDb::new(&args.db)?;
+    let db = ObjectDb::new(Connection::open(&args.db)?);
+    db.create()?;
     let oid = ObjectId::parse(&args.oid)?;
     let chunk = db.get_chunk_encoded(&oid)?;
     io::stdout().write_all(&chunk)?;

@@ -1,5 +1,4 @@
 use std::fmt::{Debug, Display, Formatter};
-use std::path::Path;
 
 use hex;
 use ring::digest::{digest, SHA512_256};
@@ -47,18 +46,20 @@ pub struct ObjectDb {
 }
 
 impl ObjectDb {
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
-        let conn = Connection::open(path)?;
-        conn.execute(
+    pub fn new(conn: Connection) -> Self {
+        ObjectDb { conn }
+    }
+
+    pub fn create(&self) -> Result<(), Error> {
+        self.conn.execute(
             "CREATE TABLE IF NOT EXISTS chunks (
                 id   TEXT PRIMARY KEY,
                 data BLOB
             )",
             (), // empty list of parameters.
         )?;
-        Ok(ObjectDb { conn })
+        Ok(())
     }
-
     pub fn insert_chunk(&self, data: &[u8]) -> Result<ObjectId, Error> {
         let hash = digest(&SHA512_256, data);
         let id = format!("{hash:x?}");

@@ -4,6 +4,7 @@ use std::io::Read;
 use anyhow::Result;
 use capnp::Word;
 use clap::Parser;
+use rusqlite::Connection;
 
 use dex::odb::ObjectDb;
 use dex::proto::odb_capnp::chunk;
@@ -35,7 +36,8 @@ fn main() -> Result<()> {
     let serialized = message.into_reader().canonicalize()?;
 
     // Write the chunk to the database.
-    let db = ObjectDb::new(&args.db)?;
+    let db = ObjectDb::new(Connection::open(&args.db)?);
+    db.create()?;
     let hash = db.insert_chunk(Word::words_to_bytes(&serialized))?;
     println!("{hash}");
     Ok(())
