@@ -5,7 +5,7 @@ use ring::digest::{digest, SHA512_256};
 use rusqlite::{Connection, OptionalExtension};
 use thiserror::Error;
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub enum ObjectId {
     SHA512_256([u8; 32]),
 }
