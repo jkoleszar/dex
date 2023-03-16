@@ -1,12 +1,29 @@
 # Protos describing the Object Database (ODB)
 @0x826aeea7c437f548;
+using Json = import "/capnp/json.capnp";
 
 struct ObjectId {
-    id @0 :Data;
+    id @0 :Data $Json.hex;
+}
+
+struct Tree {
+    struct Entry {
+        enum Kind {
+            dir @0;
+            file @1;
+            symlink @2;
+        }
+
+        kind @0 :Kind;
+        oid @1 :ObjectId;
+        name @2 :Text;
+    }
+    entries @0 :List(Entry);
 }
 
 struct Object {
-    blob @0 :Data;
+    blob @0 :Data $Json.base64;
+    tree @1 :Tree;
 }
 
 interface Import {
