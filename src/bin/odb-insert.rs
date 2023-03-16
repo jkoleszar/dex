@@ -32,7 +32,7 @@ fn main() -> Result<()> {
     let object = message.init_root::<object::Builder>();
     let blob = object.init_blob(metadata.len() as u32);
     let mut file = fs::File::open(&args.file)?;
-    file.read(blob)?;
+    file.read_exact(blob)?;
     let serialized = message.into_reader().canonicalize()?;
 
     // Write the blob to the database.

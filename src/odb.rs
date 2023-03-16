@@ -27,9 +27,6 @@ impl ObjectId {
         hex::decode_to_slice(s, &mut encoded)?;
         Ok(ObjectId::SHA512_256(encoded))
     }
-    pub fn to_string(&self) -> String {
-        format!("{self}")
-    }
 }
 
 #[derive(Error, Debug)]
