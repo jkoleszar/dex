@@ -7,7 +7,7 @@ use clap::Parser;
 use rusqlite::Connection;
 
 use dex::odb::ObjectDb;
-use dex::proto::odb_capnp::chunk;
+use dex::proto::odb_capnp::object;
 
 /// Import files into the object store
 #[derive(Parser, Debug)]
@@ -26,19 +26,21 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // Read the file from disk. For now we'll just read this into one big
-    // chunk.
+    // blob.
     let metadata = fs::metadata(&args.file)?;
     let mut message = ::capnp::message::Builder::new_default();
-    let chunk = message.init_root::<chunk::Builder>();
-    let data = chunk.init_data(metadata.len() as u32);
+    let object = message.init_root::<object::Builder>();
+    let blob = object.init_blob(metadata.len() as u32);
     let mut file = fs::File::open(&args.file)?;
-    file.read(data)?;
+    file.read(blob)?;
     let serialized = message.into_reader().canonicalize()?;
 
-    // Write the chunk to the database.
-    let db = ObjectDb::new(Connection::open(&args.db)?);
+    // Write the blob to the database.
+    let mut conn = Connection::open(&args.db)?;
+    let db = ObjectDb::new(&mut conn);
     db.create()?;
-    let hash = db.insert_chunk(Word::words_to_bytes(&serialized))?;
-    println!("{hash}");
+    let oid = db.insert_object(Word::words_to_bytes(&serialized))?;
+
+    println!("{oid}");
     Ok(())
 }

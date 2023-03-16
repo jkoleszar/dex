@@ -1,4 +1,5 @@
 pub mod odb;
+pub mod odb_rpc;
 
 pub mod proto {
     pub mod odb_capnp {

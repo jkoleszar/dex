@@ -41,18 +41,18 @@ pub enum Error {
     Missing(ObjectId),
 }
 
-pub struct ObjectDb {
-    conn: Connection,
+pub struct ObjectDb<'a> {
+    conn: &'a mut Connection,
 }
 
-impl ObjectDb {
-    pub fn new(conn: Connection) -> Self {
+impl<'a> ObjectDb<'a> {
+    pub fn new(conn: &'a mut Connection) -> Self {
         ObjectDb { conn }
     }
 
     pub fn create(&self) -> Result<(), Error> {
         self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS chunks (
+            "CREATE TABLE IF NOT EXISTS objects (
                 id   TEXT PRIMARY KEY,
                 data BLOB
             )",
@@ -60,20 +60,20 @@ impl ObjectDb {
         )?;
         Ok(())
     }
-    pub fn insert_chunk(&self, data: &[u8]) -> Result<ObjectId, Error> {
+    pub fn insert_object(&self, data: &[u8]) -> Result<ObjectId, Error> {
         let hash = digest(&SHA512_256, data);
         let id = format!("{hash:x?}");
         self.conn.execute(
-            "INSERT OR IGNORE INTO chunks (id, data) VALUES (?1, ?2)",
+            "INSERT OR IGNORE INTO objects (id, data) VALUES (?1, ?2)",
             (&id, data),
         )?;
         Ok(ObjectId::SHA512_256(hash.as_ref().try_into().unwrap()))
     }
 
-    pub fn get_chunk_encoded(&self, key: &ObjectId) -> Result<Vec<u8>, Error> {
+    pub fn get_object_encoded(&self, key: &ObjectId) -> Result<Vec<u8>, Error> {
         self.conn
             .query_row(
-                "SELECT data FROM chunks WHERE id=(?)",
+                "SELECT data FROM objects WHERE id=(?)",
                 [key.to_string()],
                 |row| row.get(0),
             )

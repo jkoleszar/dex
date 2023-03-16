@@ -1,11 +1,10 @@
-use std::io;
-use std::io::Write;
-
 use anyhow::Result;
 use clap::Parser;
-use rusqlite::Connection;
+use tokio_rusqlite::Connection;
 
 use dex::odb::{ObjectDb, ObjectId};
+use dex::odb_rpc::{Exporter, ImportToStdout};
+use dex::proto::odb_capnp::{export, import};
 
 /// Import files into the object store
 #[derive(Parser, Debug)]
@@ -19,13 +18,33 @@ struct Args {
     oid: String,
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
     let args = Args::parse();
-
-    let db = ObjectDb::new(Connection::open(&args.db)?);
-    db.create()?;
     let oid = ObjectId::parse(&args.oid)?;
-    let chunk = db.get_chunk_encoded(&oid)?;
-    io::stdout().write_all(&chunk)?;
-    Ok(())
+
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            let conn = Connection::open(&args.db).await?;
+            conn.call(|conn| ObjectDb::new(conn).create()).await?;
+            let exporter: export::Client = capnp_rpc::new_client(Exporter::new(conn));
+            let importer: import::Client = capnp_rpc::new_client(ImportToStdout);
+
+            let mut want_req = exporter.want_request();
+            match oid {
+                ObjectId::SHA512_256(hash) => want_req
+                    .get()
+                    .init_id()
+                    .init_id(32)
+                    .copy_from_slice(&hash[..]),
+            };
+            want_req.send().promise.await?;
+
+            let mut begin_req = exporter.begin_request();
+            begin_req.get().set_import(importer);
+            begin_req.send().promise.await?;
+
+            Ok(())
+        })
+        .await
 }
