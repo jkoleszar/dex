@@ -59,15 +59,15 @@ fn send_objects<I: Iterator<Item = ObjectId>>(
         .collect()
 }
 
-pub struct Exporter {
+pub struct Export {
     db: tokio_rusqlite::Connection,
     want: HashSet<ObjectId>,
     have: HashSet<ObjectId>,
 }
 
-impl Exporter {
+impl Export {
     pub fn new(db: tokio_rusqlite::Connection) -> Self {
-        Exporter {
+        Export {
             db,
             want: HashSet::new(),
             have: HashSet::new(),
@@ -75,7 +75,7 @@ impl Exporter {
     }
 }
 
-impl export::Server for Exporter {
+impl export::Server for Export {
     fn want(
         &mut self,
         params: export::WantParams,

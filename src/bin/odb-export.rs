@@ -3,7 +3,7 @@ use clap::Parser;
 use tokio_rusqlite::Connection;
 
 use dex::odb::{ObjectDb, ObjectId, ObjectIdIntoCapnp};
-use dex::odb_rpc::{Exporter, ImportToStdout};
+use dex::odb_rpc::{Export, ImportToStdout};
 use dex::proto::odb_capnp::{export, import};
 
 /// Import files into the object store
@@ -27,14 +27,14 @@ async fn main() -> Result<()> {
         .run_until(async move {
             let conn = Connection::open(&args.db).await?;
             conn.call(|conn| ObjectDb::new(conn).create()).await?;
-            let exporter: export::Client = capnp_rpc::new_client(Exporter::new(conn));
+            let export: export::Client = capnp_rpc::new_client(Export::new(conn));
             let importer: import::Client = capnp_rpc::new_client(ImportToStdout);
 
-            let mut want_req = exporter.want_request();
+            let mut want_req = export.want_request();
             want_req.get().init_id().from_oid(&oid);
             want_req.send().promise.await?;
 
-            let mut begin_req = exporter.begin_request();
+            let mut begin_req = export.begin_request();
             begin_req.get().set_import(importer);
             begin_req.send().promise.await?;
 
