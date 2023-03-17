@@ -1,3 +1,4 @@
+pub mod capnp;
 pub mod odb;
 pub mod odb_rpc;
 

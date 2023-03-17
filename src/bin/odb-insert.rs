@@ -6,7 +6,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Result};
-use capnp::Word;
+use capnp::message::TypedBuilder;
 use clap::Parser;
 use rusqlite::Connection;
 use tar::{Archive, EntryType, Header};
@@ -70,9 +70,11 @@ fn insert_directory(
     entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
 
     // Construct object
-    let mut message = ::capnp::message::Builder::new_default();
-    let object = message.init_root::<object::Builder>();
-    let mut tree = object.init_tree().init_entries(entries.len() as u32);
+    let mut object = TypedBuilder::<object::Owned>::new_default();
+    let mut tree = object
+        .init_root()
+        .init_tree()
+        .init_entries(entries.len() as u32);
     for (i, (path, oid, header)) in entries.iter().enumerate() {
         let mut entry = tree.reborrow().get(i.try_into()?);
         if let Some(filename) = path.to_str() {
@@ -115,9 +117,7 @@ fn insert_directory(
     }
 
     // Write the object to the database.
-    let serialized = message.into_reader().canonicalize()?;
-    db.insert_object(Word::words_to_bytes(&serialized))
-        .map_err(Into::into)
+    db.insert_object(object).map_err(Into::into)
 }
 
 fn insert_archive<P: AsRef<Path>>(db: &ObjectDb, file: P) -> Result<ObjectId> {
@@ -165,15 +165,10 @@ fn insert_archive<P: AsRef<Path>>(db: &ObjectDb, file: P) -> Result<ObjectId> {
 fn insert_file<P: Read>(db: &ObjectDb, file: &mut P, len: u64) -> Result<ObjectId> {
     // Read the file from disk. For now we'll just read this into one big
     // blob.
-    let mut message = ::capnp::message::Builder::new_default();
-    let object = message.init_root::<object::Builder>();
-    let blob = object.init_blob(len as u32);
+    let mut object = TypedBuilder::<object::Owned>::new_default();
+    let blob = object.init_root().init_blob(len as u32);
     file.read_exact(blob)?;
-    let serialized = message.into_reader().canonicalize()?;
-
-    // Write the blob to the database.
-    db.insert_object(Word::words_to_bytes(&serialized))
-        .map_err(Into::into)
+    db.insert_object(object).map_err(Into::into)
 }
 
 fn main() -> Result<()> {

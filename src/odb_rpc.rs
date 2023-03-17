@@ -2,12 +2,11 @@ use std::collections::HashSet;
 use std::io::BufWriter;
 
 use capnp::capability::Promise;
-use capnp::message::{Reader, ReaderOptions, SegmentArray, TypedReader};
 use capnp_rpc::pry;
 use futures::future;
 
 use crate::odb::{ObjectDb, ObjectId};
-use crate::proto::odb_capnp::{export, import, object};
+use crate::proto::odb_capnp::{export, import};
 
 pub struct ImportToStdout;
 
@@ -41,15 +40,9 @@ fn send_one_object(
     remote: import::Client,
 ) -> Promise<(), RpcError> {
     Promise::from_future(async move {
-        let encoded = db
-            .call(move |conn| ObjectDb::new(conn).get_object_encoded(&oid))
+        let object = db
+            .call(move |conn| ObjectDb::new(conn).get_object(&oid))
             .await?;
-        let segments = &[encoded.as_slice()];
-        let segment_array = SegmentArray::new(segments);
-        let object = TypedReader::<_, object::Owned>::new(Reader::new(
-            segment_array,
-            ReaderOptions::default(),
-        ));
         let mut request = remote.send_object_request();
         request.get().set_object(object.get()?)?;
         request.send().promise.await?;

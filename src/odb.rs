@@ -1,9 +1,14 @@
 use std::fmt::{Debug, Display, Formatter};
 
+use capnp::message::{Reader, ReaderOptions, ReaderSegments, TypedReader};
+use capnp::Word;
 use hex;
 use ring::digest::{digest, SHA512_256};
 use rusqlite::{Connection, OptionalExtension};
 use thiserror::Error;
+
+use crate::capnp::VecSegments;
+use crate::proto::odb_capnp::object;
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub enum ObjectId {
@@ -36,6 +41,9 @@ pub enum Error {
 
     #[error("object {0} not found")]
     Missing(ObjectId),
+
+    #[error("serialization error")]
+    SerializationError(#[from] capnp::Error),
 }
 
 pub struct ObjectDb<'a> {
@@ -57,7 +65,14 @@ impl<'a> ObjectDb<'a> {
         )?;
         Ok(())
     }
-    pub fn insert_object(&self, data: &[u8]) -> Result<ObjectId, Error> {
+
+    pub fn insert_object<S: ReaderSegments, O: Into<TypedReader<S, object::Owned>>>(
+        &self,
+        object: O,
+    ) -> Result<ObjectId, Error> {
+        let object = object.into();
+        let serialized = object.into_inner().canonicalize()?;
+        let data = Word::words_to_bytes(&serialized);
         let hash = digest(&SHA512_256, data);
         let id = format!("{hash:x?}");
         self.conn.execute(
@@ -67,15 +82,26 @@ impl<'a> ObjectDb<'a> {
         Ok(ObjectId::SHA512_256(hash.as_ref().try_into().unwrap()))
     }
 
-    pub fn get_object_encoded(&self, key: &ObjectId) -> Result<Vec<u8>, Error> {
-        self.conn
+    pub fn get_object(
+        &self,
+        key: &ObjectId,
+    ) -> Result<TypedReader<VecSegments, object::Owned>, Error> {
+        let data = self
+            .conn
             .query_row(
                 "SELECT data FROM objects WHERE id=(?)",
                 [key.to_string()],
                 |row| row.get(0),
             )
             .optional()?
-            .ok_or(Error::Missing(*key))
+            .ok_or(Error::Missing(*key))?;
+
+        // Create a new (untyped) capnp message Reader backed by the data returned
+        // from the db.
+        let message = Reader::<VecSegments>::new(VecSegments::new(data), ReaderOptions::default());
+
+        // Attach our known type to it.
+        Ok(TypedReader::<VecSegments, object::Owned>::new(message))
     }
 
     // TODO: might be nice to have an RAII Transaction wrapper, but at that
@@ -85,7 +111,6 @@ impl<'a> ObjectDb<'a> {
         self.conn.execute("BEGIN", ())?;
         Ok(())
     }
-
 
     pub fn commit(&self) -> Result<(), Error> {
         self.conn.execute("COMMIT", ())?;
