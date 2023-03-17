@@ -77,4 +77,18 @@ impl<'a> ObjectDb<'a> {
             .optional()?
             .ok_or(Error::Missing(*key))
     }
+
+    // TODO: might be nice to have an RAII Transaction wrapper, but at that
+    // point, it's probably worth bringing in something third party like
+    // diesel.
+    pub fn begin(&self) -> Result<(), Error> {
+        self.conn.execute("BEGIN", ())?;
+        Ok(())
+    }
+
+
+    pub fn commit(&self) -> Result<(), Error> {
+        self.conn.execute("COMMIT", ())?;
+        Ok(())
+    }
 }

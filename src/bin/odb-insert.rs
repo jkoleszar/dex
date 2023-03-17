@@ -183,6 +183,7 @@ fn main() -> Result<()> {
     let db = ObjectDb::new(&mut conn);
     db.create()?;
 
+    db.begin()?;
     let oid = if args.extract {
         insert_archive(&db, &args.file)?
     } else {
@@ -190,6 +191,7 @@ fn main() -> Result<()> {
         let metadata = fs::metadata(&args.file)?;
         insert_file(&db, &mut file, metadata.len())?
     };
+    db.commit()?;
 
     println!("{oid}");
     Ok(())
