@@ -11,7 +11,7 @@ use clap::Parser;
 use rusqlite::Connection;
 use tar::{Archive, EntryType, Header};
 
-use dex::odb::{ObjectDb, ObjectId};
+use dex::odb::{ObjectDb, ObjectId, ObjectIdIntoCapnp};
 use dex::proto::odb_capnp::{object, tree};
 
 /// Import files into the object store
@@ -86,12 +86,8 @@ fn insert_directory(
             bail!("Path {path:?} is not valid UTF-8");
         }
 
-        if let Some(ObjectId::SHA512_256(hash)) = oid {
-            entry
-                .reborrow()
-                .init_oid()
-                .init_id(32)
-                .copy_from_slice(&hash[..])
+        if let Some(oid) = oid {
+            entry.reborrow().init_oid().from_oid(oid)
         } else {
             bail!("Could not find entry OID for {path:?}");
         }

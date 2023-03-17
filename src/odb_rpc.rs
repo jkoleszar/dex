@@ -82,14 +82,9 @@ impl export::Server for Exporter {
         mut _results: export::WantResults,
     ) -> Promise<(), RpcError> {
         let params = pry!(params.get());
-        let id_param = pry!(pry!(params.get_id()).get_id());
-        if let Ok(oid) = id_param.try_into() {
-            let oid = ObjectId::SHA512_256(oid);
-            self.want.insert(oid);
-            Promise::ok(())
-        } else {
-            Promise::err(RpcError::failed("invalid object id".to_string()))
-        }
+        let oid = pry!(pry!(params.get_id()).try_into());
+        self.want.insert(oid);
+        Promise::ok(())
     }
 
     fn have(
@@ -98,14 +93,9 @@ impl export::Server for Exporter {
         mut _results: export::HaveResults,
     ) -> Promise<(), RpcError> {
         let params = pry!(params.get());
-        let id_param = pry!(pry!(params.get_id()).get_id());
-        if let Ok(oid) = id_param.try_into() {
-            let oid = ObjectId::SHA512_256(oid);
-            self.have.insert(oid);
-            Promise::ok(())
-        } else {
-            Promise::err(RpcError::failed("invalid object id".to_string()))
-        }
+        let oid = pry!(pry!(params.get_id()).try_into());
+        self.have.insert(oid);
+        Promise::ok(())
     }
 
     fn begin(

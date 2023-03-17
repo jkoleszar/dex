@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension};
 use thiserror::Error;
 
 use crate::capnp::VecSegments;
-use crate::proto::odb_capnp::object;
+use crate::proto::odb_capnp::{object, object_id};
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub enum ObjectId {
@@ -31,6 +31,34 @@ impl ObjectId {
         let mut encoded = [0; 32];
         hex::decode_to_slice(s, &mut encoded)?;
         Ok(ObjectId::SHA512_256(encoded))
+    }
+}
+
+/// Write an ObjectId into a capnp message.
+pub trait ObjectIdIntoCapnp {
+    fn from_oid(self, oid: &ObjectId);
+}
+impl<'a> ObjectIdIntoCapnp for object_id::Builder<'a> {
+    fn from_oid(self, oid: &ObjectId) {
+        match oid {
+            ObjectId::SHA512_256(hash) => self.init_id(32).copy_from_slice(&hash[..]),
+        };
+    }
+}
+
+/// Read an ObjectId from a capnp message.
+impl<'a> TryFrom<object_id::Reader<'a>> for ObjectId {
+    type Error = Error;
+    fn try_from(message: object_id::Reader<'a>) -> Result<ObjectId, Error> {
+        let unchecked = message.get_id()?;
+
+        // Convert a TryFromSliceError into a more specific serialization error.
+        let checked: Result<[u8; 32], _> = unchecked.try_into();
+        if let Ok(hash) = checked {
+            Ok(ObjectId::SHA512_256(hash))
+        } else {
+            Err(capnp::Error::failed("missing or corrupt object id".to_string()).into())
+        }
     }
 }
 

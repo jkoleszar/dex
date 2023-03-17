@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use tokio_rusqlite::Connection;
 
-use dex::odb::{ObjectDb, ObjectId};
+use dex::odb::{ObjectDb, ObjectId, ObjectIdIntoCapnp};
 use dex::odb_rpc::{Exporter, ImportToStdout};
 use dex::proto::odb_capnp::{export, import};
 
@@ -31,13 +31,7 @@ async fn main() -> Result<()> {
             let importer: import::Client = capnp_rpc::new_client(ImportToStdout);
 
             let mut want_req = exporter.want_request();
-            match oid {
-                ObjectId::SHA512_256(hash) => want_req
-                    .get()
-                    .init_id()
-                    .init_id(32)
-                    .copy_from_slice(&hash[..]),
-            };
+            want_req.get().init_id().from_oid(&oid);
             want_req.send().promise.await?;
 
             let mut begin_req = exporter.begin_request();
