@@ -51,7 +51,6 @@ interface Export {
     # Begin streaming objects to the remote (importing) side.
 }
 
-interface Odb {
-    import @0 () -> (importer :Import);
-    export @1 () -> (exporter :Export);
+interface ExportFactory {
+    new @0 () -> (export :Export);
 }

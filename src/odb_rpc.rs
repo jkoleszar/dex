@@ -6,7 +6,7 @@ use capnp_rpc::pry;
 use futures::future;
 
 use crate::odb::{ObjectDb, ObjectId};
-use crate::proto::odb_capnp::{export, import};
+use crate::proto::odb_capnp::{export, export_factory, import};
 
 pub struct ImportToStdout;
 
@@ -110,5 +110,27 @@ impl export::Server for Export {
             future::try_join_all(requests.into_iter()).await?;
             Ok(())
         })
+    }
+}
+
+pub struct ExportFactory {
+    db: tokio_rusqlite::Connection,
+}
+
+impl ExportFactory {
+    pub fn new(db: tokio_rusqlite::Connection) -> Self {
+        ExportFactory { db }
+    }
+}
+
+impl export_factory::Server for ExportFactory {
+    fn new(
+        &mut self,
+        _params: export_factory::NewParams,
+        mut results: export_factory::NewResults,
+    ) -> Promise<(), RpcError> {
+        let client: export::Client = capnp_rpc::new_client(Export::new(self.db.clone()));
+        results.get().set_export(client);
+        Promise::ok(())
     }
 }
