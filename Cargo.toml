@@ -7,11 +7,16 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.69"
+async-trait = "0.1.67"
 capnp = "0.16.0"
 capnp-rpc = "0.16.1"
 clap = { version = "4.1.8", features = ["derive"] }
+env_logger = "0.10.0"
+fuse-backend-rs = { version = "0.10.2", features = ["async-io"] }
 futures = "0.3.27"
 hex = "0.4.3"
+libc = "0.2.140"
+log = "0.4.17"
 ring = { version = "0.16.20", features = ["std"] }
 rusqlite = { version = "0.28.0", features = ["bundled"] }
 tar = "0.4.38"
