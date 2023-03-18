@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::io::BufWriter;
+use std::rc::Rc;
 
 use capnp::capability::Promise;
 use capnp_rpc::pry;
@@ -59,18 +61,19 @@ fn send_objects<I: Iterator<Item = ObjectId>>(
         .collect()
 }
 
+#[derive(Clone)]
 pub struct Export {
     db: tokio_rusqlite::Connection,
-    want: HashSet<ObjectId>,
-    have: HashSet<ObjectId>,
+    want: Rc<RefCell<HashSet<ObjectId>>>,
+    have: Rc<RefCell<HashSet<ObjectId>>>,
 }
 
 impl Export {
     pub fn new(db: tokio_rusqlite::Connection) -> Self {
         Export {
             db,
-            want: HashSet::new(),
-            have: HashSet::new(),
+            want: Rc::new(RefCell::new(HashSet::new())),
+            have: Rc::new(RefCell::new(HashSet::new())),
         }
     }
 }
@@ -79,22 +82,24 @@ impl export::Server for Export {
     fn want(
         &mut self,
         params: export::WantParams,
-        mut _results: export::WantResults,
+        mut results: export::WantResults,
     ) -> Promise<(), RpcError> {
         let params = pry!(params.get());
         let oid = pry!(pry!(params.get_id()).try_into());
-        self.want.insert(oid);
+        results.get().set_self(capnp_rpc::new_client(self.clone()));
+        self.want.borrow_mut().insert(oid);
         Promise::ok(())
     }
 
     fn have(
         &mut self,
         params: export::HaveParams,
-        mut _results: export::HaveResults,
+        mut results: export::HaveResults,
     ) -> Promise<(), RpcError> {
         let params = pry!(params.get());
         let oid = pry!(pry!(params.get_id()).try_into());
-        self.have.insert(oid);
+        results.get().set_self(capnp_rpc::new_client(self.clone()));
+        self.have.borrow_mut().insert(oid);
         Promise::ok(())
     }
 
@@ -105,7 +110,7 @@ impl export::Server for Export {
     ) -> Promise<(), RpcError> {
         let params = pry!(params.get());
         let import = pry!(params.get_import());
-        let requests = send_objects(self.want.iter().cloned(), self.db.clone(), import);
+        let requests = send_objects(self.want.borrow().iter().cloned(), self.db.clone(), import);
         Promise::from_future(async move {
             future::try_join_all(requests.into_iter()).await?;
             Ok(())

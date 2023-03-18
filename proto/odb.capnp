@@ -37,12 +37,12 @@ interface Import {
 }
 
 interface Export {
-    want @0 (id :ObjectId) -> ();
+    want @0 (id :ObjectId) -> (self: Export);
     # Specify an object that should be exported
     #
     # TODO: use 'stream' return type once supported.
 
-    have @1 (id :ObjectId) -> ();
+    have @1 (id :ObjectId) -> (self: Export);
     # Specify an object already present on the remote (importing) side.
     #
     # TODO: use 'stream' return type once supported.
