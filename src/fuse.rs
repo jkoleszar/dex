@@ -161,29 +161,25 @@ impl AsyncFileSystem for DexFS {
 }
 
 async fn service_kernel(server: Arc<FuseServer>, mut channel: FuseChannel) -> Result<(), Error> {
-    loop {
-        if let Some((reader, writer)) = channel.get_request()? {
-            // SAFETY: The fuse-backend-rs async io framework borrows underlying
-            // buffers from Reader and Writer, so we must ensure they are valid
-            // until the Future object returned has completed.
-            if let Err(e) = unsafe {
-                server
-                    .async_handle_message(reader, writer.into(), None, None)
-                    .await
-            } {
-                match e {
-                    fuse_backend_rs::Error::EncodeMessage(_) => {
-                        // Kernel has shut down this session (EBADF).
-                        break;
-                    }
-                    _ => {
-                        log::error!("Handling fuse message failed");
-                        continue;
-                    }
+    while let Some((reader, writer)) = channel.get_request()? {
+        // SAFETY: The fuse-backend-rs async io framework borrows underlying
+        // buffers from Reader and Writer, so we must ensure they are valid
+        // until the Future object returned has completed.
+        if let Err(e) = unsafe {
+            server
+                .async_handle_message(reader, writer.into(), None, None)
+                .await
+        } {
+            match e {
+                fuse_backend_rs::Error::EncodeMessage(_) => {
+                    // Kernel has shut down this session (EBADF).
+                    break;
+                }
+                _ => {
+                    log::error!("Handling fuse message failed");
+                    continue;
                 }
             }
-        } else {
-            break;
         }
     }
     Ok(())
