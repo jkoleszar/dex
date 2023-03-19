@@ -24,9 +24,6 @@ use crate::proto::odb_capnp::export_factory;
 pub enum Error {
     #[error("fuse error")]
     FuseError(#[from] fuse_backend_rs::transport::Error),
-
-    #[error("subtask exited")]
-    JoinError(#[from] tokio::task::JoinError),
 }
 
 struct DexFS {}
