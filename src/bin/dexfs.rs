@@ -5,6 +5,9 @@ use anyhow::Result;
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use clap::Parser;
 use futures::AsyncReadExt;
+use tokio::signal;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio_util::sync::CancellationToken;
 
 use dex::odb::ObjectId;
 use dex::proto::odb_capnp::export_factory;
@@ -26,7 +29,7 @@ struct Args {
     remote: String,
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     env_logger::init();
 
@@ -56,11 +59,21 @@ async fn main() -> Result<()> {
                 rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
 
             // Run FUSE
-            let fuse_handles =
-                dex::fuse::run_fuse(Path::new(&args.mount_point), FUSE_TASK_COUNT, export, root)?;
-            for task in fuse_handles.into_iter() {
-                task.await??;
+            let cancel = CancellationToken::new();
+            let fuse = dex::fuse::run_fuse(
+                Path::new(&args.mount_point),
+                FUSE_TASK_COUNT,
+                export,
+                root,
+                cancel.clone(),
+            );
+            let mut sigterm = signal(SignalKind::terminate())?;
+            tokio::select! {
+                _ = signal::ctrl_c() => cancel.cancel(),
+                _ = sigterm.recv() => cancel.cancel(),
+                r = fuse => r?,
             }
+            log::debug!("dexfs exiting.");
             Ok(())
         })
         .await

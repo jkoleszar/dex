@@ -1,13 +1,13 @@
 use std::ffi::CStr;
 use std::io;
+use std::panic;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use fuse_backend_rs::abi::fuse_abi::{
-    CreateIn, OpenOptions, SetattrValid,
-};
+use fuse_backend_rs::abi::fuse_abi::{CreateIn, OpenOptions, SetattrValid};
 use fuse_backend_rs::api::filesystem::{
     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, Entry, FileSystem,
 };
@@ -15,6 +15,7 @@ use fuse_backend_rs::transport::{FuseChannel, FuseSession};
 use log;
 use thiserror::Error;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::odb::ObjectId;
 use crate::proto::odb_capnp::export_factory;
@@ -23,6 +24,9 @@ use crate::proto::odb_capnp::export_factory;
 pub enum Error {
     #[error("fuse error")]
     FuseError(#[from] fuse_backend_rs::transport::Error),
+
+    #[error("subtask exited")]
+    JoinError(#[from] tokio::task::JoinError),
 }
 
 struct DexFS {}
@@ -185,12 +189,46 @@ async fn service_kernel(server: Arc<FuseServer>, mut channel: FuseChannel) -> Re
     Ok(())
 }
 
-pub fn run_fuse(
+fn fuse_thread(server: Arc<FuseServer>, channel: FuseChannel) -> JoinHandle<Result<(), Error>> {
+    static THREAD_ID: AtomicUsize = AtomicUsize::new(0);
+    let tid = THREAD_ID.fetch_add(1, Ordering::SeqCst);
+
+    // The fuse service task is !Send, so may not be rescheduled
+    // across threads, making a simple spawn() impossible. Instead,
+    // spawn a thread with an independent runtime and start the
+    // task within that context.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let thread = std::thread::Builder::new()
+        .name(format!("dexfs-fuse-{tid}"))
+        .spawn(move || -> Result<(), Error> {
+            let tid = std::thread::current().name().unwrap().to_string();
+            log::debug!("thread {tid} started");
+            let local = tokio::task::LocalSet::new();
+            local.spawn_local(service_kernel(server, channel));
+            runtime.block_on(local);
+            log::debug!("thread {tid} done");
+            Ok(())
+        })
+        .unwrap();
+    tokio::task::spawn_blocking(|| {
+        thread
+            .join()
+            .map_err(|reason| panic::resume_unwind(reason))
+            .unwrap()
+    })
+}
+
+pub async fn run_fuse(
     mount_point: &Path,
     task_count: usize,
     export: export_factory::Client,
     root: ObjectId,
-) -> Result<Vec<JoinHandle<Result<(), Error>>>, Error> {
+    until: CancellationToken,
+) -> Result<(), Error> {
     let mut tasks: Vec<JoinHandle<Result<(), Error>>> = Vec::new();
 
     // Create FUSE server.
@@ -206,28 +244,29 @@ pub fn run_fuse(
     fuse_session.mount()?;
     log::debug!("fuse session started.");
 
-    // TODO: the fuse service task is !Send, so may not be rescheduled
-    // across threads, making a simple spawn() impossible and using
-    // spawn_local() for all tasks arguably defeats the purpose of
-    // having more than one. We only use one for now, but if we decide
-    // to increase it, make a decision at that point about whether it's
-    // worth spawning a thread per task here.
-    if task_count > 1 {
-        unimplemented!();
-    }
-
     // Tasks to service the kernel
-    for fuse_tid in 0..task_count {
+    for _ in 0..task_count {
         let server = Arc::clone(&fuse_server);
         let channel = fuse_session.new_channel()?;
-        let task = tokio::task::spawn_local(async move {
-            log::debug!("spawned fuse task {fuse_tid}");
-            service_kernel(server, channel).await?;
-            log::debug!("fuse task {fuse_tid} done");
-            Ok(())
-        });
-        tasks.push(task);
+        tasks.push(fuse_thread(server, channel));
     }
 
-    Ok(tasks)
+    // Wait on all tasks. If one returns an Error, the remaining
+    // ones are detatched. The FuseSession will be dropped, which
+    // will cause them to exit.
+    for task in tasks.into_iter() {
+        tokio::select! {
+            r = task => match r {
+                Ok(result) => result?,
+                Err(join_error) => {
+                    if let Ok(reason) = join_error.try_into_panic() {
+                        // Resume the panic on the main task
+                        panic::resume_unwind(reason);
+                    }
+                }
+            },
+            _ = until.cancelled() => break,
+        }
+    }
+    Ok(())
 }
