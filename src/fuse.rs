@@ -3,10 +3,10 @@ use std::io;
 use std::panic;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use capnp_rpc::rpc_twoparty_capnp;
 use fuse_backend_rs::abi::fuse_abi::{CreateIn, OpenOptions, SetattrValid};
 use fuse_backend_rs::api::filesystem::{
     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, Entry, FileSystem,
@@ -17,6 +17,7 @@ use thiserror::Error;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::capnp::{duplex_stream_client, duplex_stream_server};
 use crate::odb::ObjectId;
 use crate::proto::odb_capnp::export_factory;
 
@@ -26,11 +27,32 @@ pub enum Error {
     FuseError(#[from] fuse_backend_rs::transport::Error),
 }
 
-struct DexFS {}
+/// Unsafe wrapper to force a type to be Sync
+///
+/// This is only needed because fuse-backend-rs has a seemingly misplaced
+/// trait bound requiring FileSystem be Sync. The crate compiles fine when
+/// that bound is removed, suggesting if it's needed at all it's by some
+/// other dependency. Provided we understand their data model correctly,
+/// it appears that the FileSystem is only called from the Server running
+/// on the thread which calls {async_,}handle_message. It's desirable that
+/// there be multiple FUSE workers which logically share a filesystem, but
+/// in our case we would like there to be some thread-local !Sync data in
+/// addition to the shared state.
+///
+/// SAFETY: Data wrapped by this type must not be shared across threads. Deref
+/// this immediately to minimize the chance of misuse.
+///
+/// TODO: resolve this with upstream.
+struct ThreadLocal<T>(T);
+unsafe impl<T> Sync for ThreadLocal<T> {}
+
+struct DexFS {
+    _export: ThreadLocal<export_factory::Client>,
+}
 
 impl DexFS {
-    fn new(_export: export_factory::Client, _root: ObjectId) -> DexFS {
-        DexFS {}
+    fn new(export: export_factory::Client, _root: ObjectId) -> DexFS {
+        DexFS {_export: ThreadLocal(export)}
     }
 }
 
@@ -157,7 +179,7 @@ impl AsyncFileSystem for DexFS {
     }
 }
 
-async fn service_kernel(server: Arc<FuseServer>, mut channel: FuseChannel) -> Result<(), Error> {
+async fn service_kernel(server: FuseServer, mut channel: FuseChannel) -> Result<(), Error> {
     while let Some((reader, writer)) = channel.get_request()? {
         // SAFETY: The fuse-backend-rs async io framework borrows underlying
         // buffers from Reader and Writer, so we must ensure they are valid
@@ -182,9 +204,19 @@ async fn service_kernel(server: Arc<FuseServer>, mut channel: FuseChannel) -> Re
     Ok(())
 }
 
-fn fuse_thread(server: Arc<FuseServer>, channel: FuseChannel) -> JoinHandle<Result<(), Error>> {
+fn fuse_thread(
+    fuse_channel: FuseChannel,
+    export: export_factory::Client,
+    root: ObjectId,
+) -> JoinHandle<Result<(), Error>> {
     static THREAD_ID: AtomicUsize = AtomicUsize::new(0);
     let tid = THREAD_ID.fetch_add(1, Ordering::SeqCst);
+
+    // capnp rpc clients may not be shared across threads, so create a
+    // pipe between this thread and the fuse thread so that it can
+    // issue RPCs.
+    let (s1, s2) = tokio::io::duplex(4096);
+    tokio::task::spawn_local(duplex_stream_server(s1, export.client));
 
     // The fuse service task is !Send, so may not be rescheduled
     // across threads, making a simple spawn() impossible. Instead,
@@ -200,8 +232,15 @@ fn fuse_thread(server: Arc<FuseServer>, channel: FuseChannel) -> JoinHandle<Resu
         .spawn(move || -> Result<(), Error> {
             let tid = std::thread::current().name().unwrap().to_string();
             log::debug!("thread {tid} started");
+
+            // Create client side of RPC pipe
+            let export = duplex_stream_client(s2).bootstrap(rpc_twoparty_capnp::Side::Server);
+
+            // Create FUSE server.
+            let fuse_server = FuseServer::new(DexFS::new(export, root));
+
             let local = tokio::task::LocalSet::new();
-            local.spawn_local(service_kernel(server, channel));
+            local.spawn_local(service_kernel(fuse_server, fuse_channel));
             runtime.block_on(local);
             log::debug!("thread {tid} done");
             Ok(())
@@ -224,9 +263,6 @@ pub async fn run_fuse(
 ) -> Result<(), Error> {
     let mut tasks: Vec<JoinHandle<Result<(), Error>>> = Vec::new();
 
-    // Create FUSE server.
-    let fuse_server = Arc::new(FuseServer::new(DexFS::new(export, root)));
-
     // Create FUSE session. Dropping this handle will unmount the filesystem.
     let mut fuse_session = FuseSession::new(
         mount_point,
@@ -239,9 +275,8 @@ pub async fn run_fuse(
 
     // Tasks to service the kernel
     for _ in 0..task_count {
-        let server = Arc::clone(&fuse_server);
         let channel = fuse_session.new_channel()?;
-        tasks.push(fuse_thread(server, channel));
+        tasks.push(fuse_thread(channel, export.clone(), root));
     }
 
     // Wait on all tasks. If one returns an Error, the remaining

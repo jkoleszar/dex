@@ -1,4 +1,8 @@
+use capnp::capability::Client;
 use capnp::message::ReaderSegments;
+use capnp_rpc::RpcSystem;
+use capnp_rpc::{rpc_twoparty_capnp, twoparty};
+use futures::AsyncReadExt;
 
 /// A ReaderSegments implementation with owned storage.
 ///
@@ -24,4 +28,33 @@ impl ReaderSegments for VecSegments {
             None
         }
     }
+}
+
+/// Instantiates a two party RpcSystem over a stream. This allows clients
+/// to run in a separate thread from their Server or the connected RpcSystem.
+pub fn duplex_stream_server(
+    stream: tokio::io::DuplexStream,
+    cap: Client,
+) -> RpcSystem<twoparty::VatId> {
+    let (reader, writer) = tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
+    let network = twoparty::VatNetwork::new(
+        reader,
+        writer,
+        rpc_twoparty_capnp::Side::Server,
+        Default::default(),
+    );
+    RpcSystem::new(Box::new(network), Some(cap))
+}
+
+/// Instantiates a two party RpcSystem over a stream. This allows clients
+/// to run in a separate thread from their Server or the connected RpcSystem.
+pub fn duplex_stream_client(stream: tokio::io::DuplexStream) -> RpcSystem<twoparty::VatId> {
+    let (reader, writer) = tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
+    let network = twoparty::VatNetwork::new(
+        reader,
+        writer,
+        rpc_twoparty_capnp::Side::Client,
+        Default::default(),
+    );
+    RpcSystem::new(Box::new(network), None)
 }
