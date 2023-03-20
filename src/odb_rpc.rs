@@ -112,7 +112,7 @@ fn send_one_object(
             .call(move |conn| ObjectDb::new(conn).get_object(&oid))
             .await?;
         let mut request = remote.send_object_request();
-        request.get().set_object(object.get()?)?;
+        request.get().set_object(object.reader().get()?)?;
         request.send().promise.await?;
         Ok(())
     })

@@ -1,13 +1,13 @@
 use std::fmt::{Debug, Display, Formatter};
 
-use capnp::message::{Reader, ReaderOptions, ReaderSegments, TypedReader};
+use capnp::message::{ReaderSegments, TypedReader};
 use capnp::Word;
 use hex;
 use ring::digest::{digest, SHA512_256};
 use rusqlite::{Connection, OptionalExtension};
 use thiserror::Error;
 
-use crate::capnp::VecSegments;
+use crate::capnp::LazyTypedReader;
 use crate::proto::odb_capnp::{object, object_id};
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
@@ -113,7 +113,7 @@ impl<'a> ObjectDb<'a> {
     pub fn get_object(
         &self,
         key: &ObjectId,
-    ) -> Result<TypedReader<VecSegments, object::Owned>, Error> {
+    ) -> Result<LazyTypedReader<object::Owned>, Error> {
         let data = self
             .conn
             .query_row(
@@ -124,12 +124,8 @@ impl<'a> ObjectDb<'a> {
             .optional()?
             .ok_or(Error::Missing(*key))?;
 
-        // Create a new (untyped) capnp message Reader backed by the data returned
-        // from the db.
-        let message = Reader::<VecSegments>::new(VecSegments::new(data), ReaderOptions::default());
-
         // Attach our known type to it.
-        Ok(TypedReader::<VecSegments, object::Owned>::new(message))
+        Ok(LazyTypedReader::<object::Owned>::new(data))
     }
 
     // TODO: might be nice to have an RAII Transaction wrapper, but at that
