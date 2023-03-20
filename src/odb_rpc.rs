@@ -11,8 +11,6 @@ use tokio::sync::oneshot;
 use crate::odb::{ObjectDb, ObjectId};
 use crate::proto::odb_capnp::{export, export_factory, import};
 
-pub struct ImportToStdout;
-
 type RpcError = ::capnp::Error;
 
 impl From<crate::odb::Error> for RpcError {
@@ -20,6 +18,8 @@ impl From<crate::odb::Error> for RpcError {
         RpcError::failed(format!("odb: {value}"))
     }
 }
+
+pub struct ImportToStdout;
 
 impl import::Server for ImportToStdout {
     fn send_object(
@@ -33,6 +33,14 @@ impl import::Server for ImportToStdout {
         let mut out = ::capnp::message::Builder::new_default();
         pry!(out.set_root_canonical(object));
         pry!(capnp::serialize::write_message(&mut stdout, &out));
+        Promise::ok(())
+    }
+
+    fn done(
+        &mut self,
+        _params: import::DoneParams,
+        mut _results: import::DoneResults,
+    ) -> Promise<(), RpcError> {
         Promise::ok(())
     }
 }
