@@ -6,6 +6,7 @@ use std::rc::Rc;
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 use futures::future;
+use tokio::sync::oneshot;
 
 use crate::odb::{ObjectDb, ObjectId};
 use crate::proto::odb_capnp::{export, export_factory, import};
@@ -33,6 +34,63 @@ impl import::Server for ImportToStdout {
         pry!(out.set_root_canonical(object));
         pry!(capnp::serialize::write_message(&mut stdout, &out));
         Promise::ok(())
+    }
+}
+
+/// An Import server that receives objects, writes them to the database,
+/// and notifies of completion to a oneshot channel.
+pub struct OneshotImport {
+    db: Option<tokio_rusqlite::Connection>,
+    oids: Rc<RefCell<Option<Vec<ObjectId>>>>,
+    completion: Option<oneshot::Sender<Vec<ObjectId>>>,
+}
+
+impl import::Server for OneshotImport {
+    fn send_object(
+        &mut self,
+        params: import::SendObjectParams,
+        mut _results: import::SendObjectResults,
+    ) -> Promise<(), RpcError> {
+        if let Some(db) = self.db.as_ref() {
+            let params = pry!(params.get());
+            let object = pry!(params.get_object());
+            // Must copy the sub-message out of its container in order to write
+            // it to the database.
+            // TODO: remove this copy.
+            let mut out = ::capnp::message::Builder::new_default();
+            pry!(out.set_root_canonical(object));
+
+            let db = db.clone();
+            let rc = Rc::clone(&self.oids);
+            Promise::from_future(async move {
+                let oid = db.call(|conn| {
+                    ObjectDb::new(conn).insert_object(out)
+                }).await?;
+                // Safe to unwrap oids because it shares the same lifetime as db.
+                Ok(rc.borrow_mut().as_mut().unwrap().push(oid))
+            })
+        } else {
+            Promise::err(RpcError::failed("attempted to reuse import".to_string()))
+        }
+    }
+
+    fn done(
+        &mut self,
+        _params: import::DoneParams,
+        mut _results: import::DoneResults,
+    ) -> Promise<(), RpcError> {
+        if let Some(tx) = self.completion.take() {
+            // Drop reference to the database.
+            self.db.take();
+
+            // Safe to unwrap the result because we either take() all or none.
+            pry!(tx
+                .send(self.oids.take().unwrap())
+                .map_err(|_| RpcError::failed("receiver hung up".to_string())));
+            Promise::ok(())
+        } else {
+            Promise::err(RpcError::failed("done called more than once".to_string()))
+        }
     }
 }
 
