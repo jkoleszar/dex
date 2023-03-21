@@ -53,6 +53,19 @@ pub struct OneshotImport {
     completion: Option<oneshot::Sender<Vec<ObjectId>>>,
 }
 
+impl OneshotImport {
+    pub fn new(
+        db: tokio_rusqlite::Connection,
+        completion: oneshot::Sender<Vec<ObjectId>>,
+    ) -> OneshotImport {
+        OneshotImport {
+            db: Some(db),
+            oids: Rc::new(RefCell::new(Some(Vec::new()))),
+            completion: Some(completion),
+        }
+    }
+}
+
 impl import::Server for OneshotImport {
     fn send_object(
         &mut self,
@@ -71,9 +84,9 @@ impl import::Server for OneshotImport {
             let db = db.clone();
             let rc = Rc::clone(&self.oids);
             Promise::from_future(async move {
-                let oid = db.call(|conn| {
-                    ObjectDb::new(conn).insert_object(out)
-                }).await?;
+                let oid = db
+                    .call(|conn| ObjectDb::new(conn).insert_object(out))
+                    .await?;
                 // Safe to unwrap oids because it shares the same lifetime as db.
                 Ok(rc.borrow_mut().as_mut().unwrap().push(oid))
             })
