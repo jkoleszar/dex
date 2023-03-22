@@ -1,5 +1,6 @@
 pub mod capnp;
 pub mod fuse;
+pub mod log;
 pub mod odb;
 pub mod odb_rpc;
 
