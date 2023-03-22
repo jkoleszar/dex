@@ -72,6 +72,7 @@ impl import::Server for OneshotImport {
         params: import::SendObjectParams,
         mut _results: import::SendObjectResults,
     ) -> Promise<(), RpcError> {
+        log::debug!("oneshot import send_object");
         if let Some(db) = self.db.as_ref() {
             let params = pry!(params.get());
             let object = pry!(params.get_object());
@@ -87,6 +88,7 @@ impl import::Server for OneshotImport {
                 let oid = db
                     .call(|conn| ObjectDb::new(conn).insert_object(out))
                     .await?;
+                log::debug!("received oid {} from remote", &oid);
                 // Safe to unwrap oids because it shares the same lifetime as db.
                 Ok(rc.borrow_mut().as_mut().unwrap().push(oid))
             })
@@ -100,6 +102,7 @@ impl import::Server for OneshotImport {
         _params: import::DoneParams,
         mut _results: import::DoneResults,
     ) -> Promise<(), RpcError> {
+        log::debug!("oneshot import done");
         if let Some(tx) = self.completion.take() {
             // Drop reference to the database.
             self.db.take();
@@ -166,6 +169,7 @@ impl export::Server for Export {
         let params = pry!(params.get());
         let oid = pry!(pry!(params.get_id()).try_into());
         results.get().set_self(capnp_rpc::new_client(self.clone()));
+        log::debug!("want {oid}");
         self.want.borrow_mut().insert(oid);
         Promise::ok(())
     }
@@ -178,6 +182,7 @@ impl export::Server for Export {
         let params = pry!(params.get());
         let oid = pry!(pry!(params.get_id()).try_into());
         results.get().set_self(capnp_rpc::new_client(self.clone()));
+        log::debug!("have {oid}");
         self.have.borrow_mut().insert(oid);
         Promise::ok(())
     }
@@ -191,7 +196,9 @@ impl export::Server for Export {
         let import = pry!(params.get_import());
         let requests = send_objects(self.want.borrow().iter().cloned(), self.db.clone(), import);
         Promise::from_future(async move {
+            log::debug!("begin export");
             future::try_join_all(requests.into_iter()).await?;
+            log::debug!("export done");
             Ok(())
         })
     }
@@ -215,6 +222,7 @@ impl export_factory::Server for ExportFactory {
     ) -> Promise<(), RpcError> {
         let client: export::Client = capnp_rpc::new_client(Export::new(self.db.clone()));
         results.get().set_export(client);
+        log::debug!("starting new export");
         Promise::ok(())
     }
 }

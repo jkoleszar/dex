@@ -24,6 +24,7 @@ struct Args {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    env_logger::init();
     let args = Args::parse();
     let addr = args
         .listen_address
@@ -38,8 +39,10 @@ async fn main() -> Result<()> {
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             let factory: export_factory::Client = capnp_rpc::new_client(ExportFactory::new(conn));
 
+            log::info!("odb-export service started.");
             loop {
                 let (stream, _) = listener.accept().await?;
+                log::debug!("accepted connection");
                 stream.set_nodelay(true)?;
                 let (reader, writer) =
                     tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
@@ -51,7 +54,11 @@ async fn main() -> Result<()> {
                 );
                 let rpc_system = RpcSystem::new(Box::new(network), Some(factory.clone().client));
 
-                tokio::task::spawn_local(rpc_system);
+                tokio::task::spawn_local(async move {
+                    log::debug!("starting rpc system");
+                    let result = rpc_system.await;
+                    log::debug!("client disconnected: {result:?}");
+                });
             }
         })
         .await
