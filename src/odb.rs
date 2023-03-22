@@ -64,13 +64,13 @@ impl<'a> TryFrom<object_id::Reader<'a>> for ObjectId {
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("database error")]
+    #[error("database error: {0}")]
     DbError(#[from] rusqlite::Error),
 
     #[error("object {0} not found")]
     Missing(ObjectId),
 
-    #[error("serialization error")]
+    #[error("serialization error: {0}")]
     SerializationError(#[from] capnp::Error),
 }
 
