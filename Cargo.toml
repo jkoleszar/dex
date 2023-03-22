@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.69"
 async-trait = "0.1.67"
-capnp = "0.16.0"
+capnp = { version = "0.16.0", features = ["sync_reader"] }
 capnp-rpc = "0.16.1"
 clap = { version = "4.1.8", features = ["derive"] }
 env_logger = "0.10.0"
