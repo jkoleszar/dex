@@ -78,6 +78,8 @@ pub struct ObjectDb<'a> {
     conn: &'a mut Connection,
 }
 
+pub type ObjectReader = LazyTypedReader<object::Owned>;
+
 impl<'a> ObjectDb<'a> {
     pub fn new(conn: &'a mut Connection) -> Self {
         ObjectDb { conn }
@@ -110,10 +112,7 @@ impl<'a> ObjectDb<'a> {
         Ok(ObjectId::SHA512_256(hash.as_ref().try_into().unwrap()))
     }
 
-    pub fn get_object(
-        &self,
-        key: &ObjectId,
-    ) -> Result<LazyTypedReader<object::Owned>, Error> {
+    pub fn get_object(&self, key: &ObjectId) -> Result<ObjectReader, Error> {
         let data = self
             .conn
             .query_row(
