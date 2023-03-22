@@ -11,6 +11,7 @@ async-trait = "0.1.67"
 capnp = { version = "0.16.0", features = ["sync_reader"] }
 capnp-rpc = "0.16.1"
 clap = { version = "4.1.8", features = ["derive"] }
+console-subscriber = "0.1.8"
 env_logger = "0.10.0"
 fuse-backend-rs = { version = "0.10.2", features = ["async-io"] }
 futures = "0.3.27"
@@ -21,7 +22,7 @@ ring = { version = "0.16.20", features = ["std"] }
 rusqlite = { version = "0.28.0", features = ["bundled"] }
 tar = "0.4.38"
 thiserror = "1.0.39"
-tokio = { version = "1.26.0", features = ["net", "rt", "rt-multi-thread", "macros", "io-util", "signal"] }
+tokio = { version = "1.26.0", features = ["net", "rt", "rt-multi-thread", "macros", "io-util", "signal", "tracing"] }
 tokio-rusqlite = "0.3.0"
 tokio-util = { version = "0.7.7", features = ["compat"] }
 
