@@ -3,9 +3,8 @@ use std::collections::HashSet;
 use std::io::BufWriter;
 use std::rc::Rc;
 
-use capnp::capability::Promise;
+use capnp::capability::{Promise, RemotePromise};
 use capnp_rpc::pry;
-use futures::future;
 use tokio::sync::oneshot;
 
 use crate::odb::{ObjectDb, ObjectId};
@@ -45,12 +44,17 @@ impl import::Server for ImportToStdout {
     }
 }
 
-/// An Import server that receives objects, writes them to the database,
-/// and notifies of completion to a oneshot channel.
-pub struct OneshotImport {
+struct OneshotImportState {
     db: Option<tokio_rusqlite::Connection>,
     oids: Rc<RefCell<Option<Vec<ObjectId>>>>,
     completion: Option<oneshot::Sender<Vec<ObjectId>>>,
+}
+
+/// An Import server that receives objects, writes them to the database,
+/// and notifies of completion to a oneshot channel.
+#[derive(Clone)]
+pub struct OneshotImport {
+    state: Rc<RefCell<OneshotImportState>>,
 }
 
 impl OneshotImport {
@@ -58,10 +62,12 @@ impl OneshotImport {
         db: tokio_rusqlite::Connection,
         completion: oneshot::Sender<Vec<ObjectId>>,
     ) -> OneshotImport {
-        OneshotImport {
-            db: Some(db),
-            oids: Rc::new(RefCell::new(Some(Vec::new()))),
-            completion: Some(completion),
+        Self {
+            state: Rc::new(RefCell::new(OneshotImportState {
+                db: Some(db),
+                oids: Rc::new(RefCell::new(Some(Vec::new()))),
+                completion: Some(completion),
+            })),
         }
     }
 }
@@ -70,12 +76,17 @@ impl import::Server for OneshotImport {
     fn send_object(
         &mut self,
         params: import::SendObjectParams,
-        mut _results: import::SendObjectResults,
+        mut results: import::SendObjectResults,
     ) -> Promise<(), RpcError> {
         log::debug!("oneshot import send_object");
-        if let Some(db) = self.db.as_ref() {
+        if let Some(db) = self.state.borrow().db.as_ref() {
             let params = pry!(params.get());
             let object = pry!(params.get_object());
+
+            // Provide a hook for pipelining requests back to this
+            // server.
+            results.get().set_self(capnp_rpc::new_client(self.clone()));
+
             // Must copy the sub-message out of its container in order to write
             // it to the database.
             // TODO: remove this copy.
@@ -83,14 +94,15 @@ impl import::Server for OneshotImport {
             pry!(out.set_root_canonical(object));
 
             let db = db.clone();
-            let rc = Rc::clone(&self.oids);
+            let rc = Rc::clone(&self.state.borrow().oids);
             Promise::from_future(async move {
                 let oid = db
                     .call(|conn| ObjectDb::new(conn).insert_object(out))
                     .await?;
                 log::debug!("received oid {} from remote", &oid);
                 // Safe to unwrap oids because it shares the same lifetime as db.
-                Ok(rc.borrow_mut().as_mut().unwrap().push(oid))
+                rc.borrow_mut().as_mut().unwrap().push(oid);
+                Ok(())
             })
         } else {
             Promise::err(RpcError::failed("attempted to reuse import".to_string()))
@@ -103,44 +115,20 @@ impl import::Server for OneshotImport {
         mut _results: import::DoneResults,
     ) -> Promise<(), RpcError> {
         log::debug!("oneshot import done");
-        if let Some(tx) = self.completion.take() {
+        let mut state = self.state.borrow_mut();
+        if let Some(tx) = state.completion.take() {
             // Drop reference to the database.
-            self.db.take();
+            state.db.take();
 
             // Safe to unwrap the result because we either take() all or none.
             pry!(tx
-                .send(self.oids.take().unwrap())
+                .send(state.oids.take().unwrap())
                 .map_err(|_| RpcError::failed("receiver hung up".to_string())));
             Promise::ok(())
         } else {
             Promise::err(RpcError::failed("done called more than once".to_string()))
         }
     }
-}
-
-fn send_one_object(
-    oid: ObjectId,
-    db: tokio_rusqlite::Connection,
-    remote: import::Client,
-) -> Promise<(), RpcError> {
-    Promise::from_future(async move {
-        let object = db
-            .call(move |conn| ObjectDb::new(conn).get_object(&oid))
-            .await?;
-        let mut request = remote.send_object_request();
-        request.get().set_object(object.reader().get()?)?;
-        request.send().promise.await?;
-        Ok(())
-    })
-}
-
-fn send_objects<I: Iterator<Item = ObjectId>>(
-    oids: I,
-    db: tokio_rusqlite::Connection,
-    remote: import::Client,
-) -> Vec<Promise<(), RpcError>> {
-    oids.map(|oid| send_one_object(oid, db.clone(), remote.clone()))
-        .collect()
 }
 
 #[derive(Clone)]
@@ -192,15 +180,39 @@ impl export::Server for Export {
         params: export::BeginParams,
         mut _results: export::BeginResults,
     ) -> Promise<(), RpcError> {
+        use crate::proto::odb_capnp::import::send_object_results;
         let params = pry!(params.get());
-        let import = pry!(params.get_import());
-        let requests = send_objects(self.want.borrow().iter().cloned(), self.db.clone(), import);
-        Promise::from_future(async move {
-            log::debug!("begin export");
-            future::try_join_all(requests.into_iter()).await?;
-            log::debug!("export done");
-            Ok(())
-        })
+        let remote = pry!(params.get_import());
+        let db = self.db.clone();
+        let oids = self.want.borrow().clone();
+        log::debug!("begin ({} objects)", oids.len());
+        if !oids.is_empty() {
+            Promise::from_future(async move {
+                let mut pipeline: Option<RemotePromise<send_object_results::Owned>> = None;
+                for oid in oids.into_iter() {
+                    log::debug!("fetching {oid} from database");
+                    let object = db
+                        .call(move |conn| ObjectDb::new(conn).get_object(&oid))
+                        .await?;
+                    log::debug!("sending to remote");
+                    let mut request = if let Some(prev) = pipeline {
+                        prev.pipeline.get_self().send_object_request()
+                    } else {
+                        remote.send_object_request()
+                    };
+                    request.get().set_object(object.reader().get()?)?;
+                    pipeline = Some(request.send())
+                }
+                let mut done = pipeline.unwrap().pipeline.get_self().done_request();
+                done.get().set_self(remote);
+
+                log::debug!("waiting for objects to be sent");
+                done.send().promise.await?;
+                Ok(())
+            })
+        } else {
+            Promise::err(RpcError::failed("no objects requested".to_string()))
+        }
     }
 }
 

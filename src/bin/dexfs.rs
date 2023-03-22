@@ -7,9 +7,11 @@ use clap::Parser;
 use futures::AsyncReadExt;
 use tokio::signal;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio_rusqlite::Connection;
 use tokio_util::sync::CancellationToken;
 
-use dex::odb::ObjectId;
+use dex::odb::{ObjectDb, ObjectId};
+use dex::odb_readthrough::Readthrough;
 use dex::proto::odb_capnp::export_factory;
 
 const FUSE_TASK_COUNT: usize = 1;
@@ -32,6 +34,7 @@ struct Args {
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     env_logger::init();
+    console_subscriber::init();
 
     let args = Args::parse();
     let addr = args
@@ -58,12 +61,21 @@ async fn main() -> Result<()> {
             let export: export_factory::Client =
                 rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
 
+            // Object database local to the FUSE server. For now, just keep
+            // this in memory.
+            // TODO: perisitant storage
+            let db = Connection::open_in_memory().await?;
+            db.call(|conn| ObjectDb::new(conn).create()).await?;
+
+            // Readthrough service
+            let (odb, odb_service) = Readthrough { db, export }.serve();
+
             // Run FUSE
             let cancel = CancellationToken::new();
             let fuse = dex::fuse::run_fuse(
                 Path::new(&args.mount_point),
                 FUSE_TASK_COUNT,
-                export,
+                odb,
                 root,
                 cancel.clone(),
             );
@@ -72,6 +84,8 @@ async fn main() -> Result<()> {
                 _ = signal::ctrl_c() => cancel.cancel(),
                 _ = sigterm.recv() => cancel.cancel(),
                 r = fuse => r?,
+                r = odb_service => r?,
+                r = rpc_system => r?,
             }
             log::debug!("dexfs exiting.");
             Ok(())

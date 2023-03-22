@@ -2,11 +2,10 @@ use std::ffi::CStr;
 use std::io;
 use std::panic;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use capnp_rpc::rpc_twoparty_capnp;
 use fuse_backend_rs::abi::fuse_abi::{CreateIn, OpenOptions, SetattrValid};
 use fuse_backend_rs::api::filesystem::{
     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, Entry, FileSystem,
@@ -14,45 +13,101 @@ use fuse_backend_rs::api::filesystem::{
 use fuse_backend_rs::transport::{FuseChannel, FuseSession};
 use log;
 use thiserror::Error;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::capnp::{duplex_stream_client, duplex_stream_server};
+use crate::log::LogIfError;
 use crate::odb::ObjectId;
-use crate::proto::odb_capnp::export_factory;
+use crate::odb_readthrough;
+use crate::odb_readthrough::LazyObject;
 
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("fuse error")]
     FuseError(#[from] fuse_backend_rs::transport::Error),
+
+    #[error("database error")]
+    DbError(#[from] rusqlite::Error),
 }
 
-/// Unsafe wrapper to force a type to be Sync
-///
-/// This is only needed because fuse-backend-rs has a seemingly misplaced
-/// trait bound requiring FileSystem be Sync. The crate compiles fine when
-/// that bound is removed, suggesting if it's needed at all it's by some
-/// other dependency. Provided we understand their data model correctly,
-/// it appears that the FileSystem is only called from the Server running
-/// on the thread which calls {async_,}handle_message. It's desirable that
-/// there be multiple FUSE workers which logically share a filesystem, but
-/// in our case we would like there to be some thread-local !Sync data in
-/// addition to the shared state.
-///
-/// SAFETY: Data wrapped by this type must not be shared across threads. Deref
-/// this immediately to minimize the chance of misuse.
-///
-/// TODO: resolve this with upstream.
-struct ThreadLocal<T>(T);
-unsafe impl<T> Sync for ThreadLocal<T> {}
+#[derive(Error, Debug)]
+pub enum InodeError {
+    #[error("entry missing from inode map")]
+    Invalid(u64),
+}
+
+impl From<InodeError> for io::Error {
+    fn from(value: InodeError) -> io::Error {
+        match value {
+            InodeError::Invalid(_) => io::Error::from_raw_os_error(libc::ENOENT),
+        }
+    }
+}
+
+/// An InodeEntry that may be shared between threads.
+type SharedInodeEntry = Arc<LazyObject>;
+
+/// DexFS state shared across all workers
+struct SharedState {
+    /// Connection to object database
+    odb: mpsc::Sender<odb_readthrough::Request>,
+
+    /// Indexed by inode
+    inodes: RwLock<Vec<Option<SharedInodeEntry>>>,
+}
+
+impl SharedState {
+    fn new(odb: mpsc::Sender<odb_readthrough::Request>, root: ObjectId) -> Arc<SharedState> {
+        let mut state = SharedState {
+            odb,
+            inodes: Vec::new().into(),
+        };
+
+        // inode 0 is unused
+        state.alloc_inode();
+
+        // inode 1 is the root object
+        let ino = state.alloc_inode();
+        let entry = Arc::new(LazyObject::new(root));
+        state.inodes.write().unwrap()[ino] = Some(entry);
+
+        Arc::new(state)
+    }
+
+    fn alloc_inode(&mut self) -> usize {
+        let mut vec = self.inodes.write().unwrap();
+        let ino = vec.len();
+        vec.push(None);
+        ino
+    }
+
+    fn inode_index(inode: u64) -> Result<usize, InodeError> {
+        inode.try_into().map_err(|_| InodeError::Invalid(inode))
+    }
+
+    fn get_inode(&self, inode: u64) -> Result<SharedInodeEntry, InodeError> {
+        let entry = self
+            .inodes
+            .read()
+            .unwrap() // assume the lock was not poisoned.
+            .get(Self::inode_index(inode)?)
+            .ok_or(InodeError::Invalid(inode))? // inode was never allocated
+            .as_ref()
+            .ok_or(InodeError::Invalid(inode))? // inode was deleted
+            .clone();
+        Ok(entry)
+    }
+}
 
 struct DexFS {
-    _export: ThreadLocal<export_factory::Client>,
+    /// Shared state
+    shared: Arc<SharedState>,
 }
 
 impl DexFS {
-    fn new(export: export_factory::Client, _root: ObjectId) -> DexFS {
-        DexFS {_export: ThreadLocal(export)}
+    fn new(shared: Arc<SharedState>) -> DexFS {
+        DexFS { shared }
     }
 }
 
@@ -61,6 +116,10 @@ type FuseServer = fuse_backend_rs::api::server::Server<DexFS>;
 impl FileSystem for DexFS {
     type Inode = u64;
     type Handle = u64;
+}
+
+fn eio() -> io::Error {
+    io::Error::from_raw_os_error(libc::ENOENT)
 }
 
 #[async_trait]
@@ -77,9 +136,16 @@ impl AsyncFileSystem for DexFS {
     async fn async_getattr(
         &self,
         _ctx: &Context,
-        _inode: <Self as FileSystem>::Inode,
+        inode: <Self as FileSystem>::Inode,
         _handle: Option<<Self as FileSystem>::Handle>,
     ) -> io::Result<(libc::stat64, Duration)> {
+        let entry = self.shared.get_inode(inode).log_if_error("get_inode")?;
+        let odb = self.shared.odb.clone();
+        let _object = entry
+            .get(odb)
+            .await
+            .log_if_error("while retrieving object")
+            .map_err(|_| eio())?;
         unimplemented!()
     }
 
@@ -204,64 +270,17 @@ async fn service_kernel(server: FuseServer, mut channel: FuseChannel) -> Result<
     Ok(())
 }
 
-fn fuse_thread(
-    fuse_channel: FuseChannel,
-    export: export_factory::Client,
-    root: ObjectId,
-) -> JoinHandle<Result<(), Error>> {
-    static THREAD_ID: AtomicUsize = AtomicUsize::new(0);
-    let tid = THREAD_ID.fetch_add(1, Ordering::SeqCst);
-
-    // capnp rpc clients may not be shared across threads, so create a
-    // pipe between this thread and the fuse thread so that it can
-    // issue RPCs.
-    let (s1, s2) = tokio::io::duplex(4096);
-    tokio::task::spawn_local(duplex_stream_server(s1, export.client));
-
-    // The fuse service task is !Send, so may not be rescheduled
-    // across threads, making a simple spawn() impossible. Instead,
-    // spawn a thread with an independent runtime and start the
-    // task within that context.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
-    let thread = std::thread::Builder::new()
-        .name(format!("dexfs-fuse-{tid}"))
-        .spawn(move || -> Result<(), Error> {
-            let tid = std::thread::current().name().unwrap().to_string();
-            log::debug!("thread {tid} started");
-
-            // Create client side of RPC pipe
-            let export = duplex_stream_client(s2).bootstrap(rpc_twoparty_capnp::Side::Server);
-
-            // Create FUSE server.
-            let fuse_server = FuseServer::new(DexFS::new(export, root));
-
-            let local = tokio::task::LocalSet::new();
-            local.spawn_local(service_kernel(fuse_server, fuse_channel));
-            runtime.block_on(local);
-            log::debug!("thread {tid} done");
-            Ok(())
-        })
-        .unwrap();
-    tokio::task::spawn_blocking(|| {
-        thread
-            .join()
-            .map_err(|reason| panic::resume_unwind(reason))
-            .unwrap()
-    })
-}
-
 pub async fn run_fuse(
     mount_point: &Path,
     task_count: usize,
-    export: export_factory::Client,
+    odb: mpsc::Sender<odb_readthrough::Request>,
     root: ObjectId,
     until: CancellationToken,
 ) -> Result<(), Error> {
     let mut tasks: Vec<JoinHandle<Result<(), Error>>> = Vec::new();
+
+    // Initialize state shared across all workers.
+    let fs_shared_state = SharedState::new(odb, root);
 
     // Create FUSE session. Dropping this handle will unmount the filesystem.
     let mut fuse_session = FuseSession::new(
@@ -274,9 +293,22 @@ pub async fn run_fuse(
     log::debug!("fuse session started.");
 
     // Tasks to service the kernel
-    for _ in 0..task_count {
+    for tid in 0..task_count {
         let channel = fuse_session.new_channel()?;
-        tasks.push(fuse_thread(channel, export.clone(), root));
+        //tasks.push(fuse_thread(channel, Arc::clone(&fs_shared_state)));
+        let shared = Arc::clone(&fs_shared_state);
+
+        // TODO: It seems like this should be spawn() not spawn_local() as
+        // we want the task to run across different workers, but
+        // async_handle_message takes a Option<&dyn MetricsHook> parameter
+        // which is not Send.
+        tasks.push(tokio::task::spawn_local(async move {
+            log::debug!("dexfs-fuse-{tid} task started");
+            let server = FuseServer::new(DexFS::new(shared));
+            let r = service_kernel(server, channel).await;
+            log::debug!("dexfs-fuse-{tid} task exited: {r:?}");
+            r
+        }));
     }
 
     // Wait on all tasks. If one returns an Error, the remaining

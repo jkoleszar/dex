@@ -27,12 +27,12 @@ struct Object {
 }
 
 interface Import {
-    sendObject @0 (object :Object) -> ();
+    sendObject @0 (object :Object) -> (self: Import);
     # Send the provided object to the remote (importing) side.
     #
     # TODO: use 'stream' return type once supported.
 
-    done @1 ();
+    done @1 (self: Import);
     # Invoke once all objects have been sent.
 }
 
