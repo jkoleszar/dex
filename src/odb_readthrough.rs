@@ -1,6 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::RwLock;
-
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -135,62 +132,49 @@ impl Readthrough {
 }
 
 /// A handle to a remote object that is fetched the first time it is accessed.
-pub struct LazyObject {
-    oid: ObjectId,
-    valid: AtomicBool,
-    fetch_lock: tokio::sync::Mutex<()>,
-    data: RwLock<ObjectReader>,
+pub enum LazyObject {
+    Future(ObjectId, mpsc::Sender<Request>),
+    Pending(oneshot::Receiver<Response>),
+    Missing(ObjectId),
+    Error(Error),
+    Ok(ObjectReader),
 }
 
 impl LazyObject {
-    pub fn new(oid: ObjectId) -> Self {
-        LazyObject {
-            oid,
-            valid: AtomicBool::new(false),
-            data: ObjectReader::new(Vec::new()).into(),
-            fetch_lock: tokio::sync::Mutex::new(()),
-        }
+    pub fn new(oid: ObjectId, cache: mpsc::Sender<Request>) -> Self {
+        LazyObject::Future(oid, cache)
     }
 
-    /// Gets the object using the given database as a read-through cache.
-    pub async fn get(&self, cache: mpsc::Sender<Request>) -> Result<&RwLock<ObjectReader>, Error> {
-        if self.valid.load(Ordering::SeqCst) {
-            // The data has been fetched (is valid).
-            return Ok(&self.data);
-        }
+    pub async fn get(&mut self) -> &Self {
+        match self {
+            LazyObject::Future(oid, cache) => {
+                log::debug!("requesting oid {} from cache", &oid);
+                let (tx, rx) = oneshot::channel();
+                if cache
+                    .send(Request {
+                        oid: *oid,
+                        callback: tx,
+                    })
+                    .await
+                    .is_err()
+                {
+                    *self = LazyObject::Error(Error::RemoteError);
+                    return self;
+                }
 
-        // Fetch the object from the remote.
-        let _fetch_lock = self.fetch_lock.lock().await;
+                log::debug!("waiting on cache");
+                *self = match rx.await {
+                    Ok(Ok(object)) => LazyObject::Ok(object),
+                    Ok(Err(Error::OdbError(odb::Error::Missing(oid)))) => LazyObject::Missing(oid),
+                    Ok(Err(e)) => LazyObject::Error(e),
 
-        // There may have been multiple threads racing on the fetch lock.
-        // The first one should observe the data is still unset and complete
-        // the fetch, the remainder should observe the data is set and
-        // return it.
-        if self.valid.load(Ordering::SeqCst) {
-            // The data has been fetched (is valid).
-            return Ok(&self.data);
-        }
-
-        // We are responsible for populating the data. Request it from the
-        // cache.
-        log::debug!("requesting oid {} from cache", &self.oid);
-        let (tx, rx) = oneshot::channel();
-        cache
-            .send(Request {
-                oid: self.oid,
-                callback: tx,
-            })
-            .await
-            .map_err(|_| Error::RemoteError)?;
-        log::debug!("waiting on oid {} from cache", &self.oid);
-        match rx.await {
-            Ok(Ok(object)) => {
-                *self.data.write().unwrap() = object;
-                self.valid.store(true, Ordering::SeqCst);
-                Ok(&self.data)
+                    // The cache task failed to send a callback
+                    Err(_) => LazyObject::Error(Error::RemoteError),
+                };
+                self
             }
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(Error::RemoteError),
+
+            _ => self,
         }
     }
 }

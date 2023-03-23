@@ -14,10 +14,10 @@ use fuse_backend_rs::transport::{FuseChannel, FuseSession};
 use log;
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::log::LogIfError;
 use crate::odb::ObjectId;
 use crate::odb_readthrough;
 use crate::odb_readthrough::LazyObject;
@@ -40,18 +40,22 @@ pub enum InodeError {
 impl From<InodeError> for io::Error {
     fn from(value: InodeError) -> io::Error {
         match value {
-            InodeError::Invalid(_) => io::Error::from_raw_os_error(libc::ENOENT),
+            InodeError::Invalid(_) => enoent(),
         }
     }
 }
 
 /// An InodeEntry that may be shared between threads.
-type SharedInodeEntry = Arc<LazyObject>;
+struct InodeEntry {
+    object: LazyObject,
+}
+
+type SharedInodeEntry = Arc<AsyncMutex<InodeEntry>>;
 
 /// DexFS state shared across all workers
 struct SharedState {
     /// Connection to object database
-    odb: mpsc::Sender<odb_readthrough::Request>,
+    _odb: mpsc::Sender<odb_readthrough::Request>,
 
     /// Indexed by inode
     inodes: RwLock<Vec<Option<SharedInodeEntry>>>,
@@ -60,7 +64,7 @@ struct SharedState {
 impl SharedState {
     fn new(odb: mpsc::Sender<odb_readthrough::Request>, root: ObjectId) -> Arc<SharedState> {
         let mut state = SharedState {
-            odb,
+            _odb: odb.clone(),
             inodes: Vec::new().into(),
         };
 
@@ -69,7 +73,9 @@ impl SharedState {
 
         // inode 1 is the root object
         let ino = state.alloc_inode();
-        let entry = Arc::new(LazyObject::new(root));
+        let entry = Arc::new(AsyncMutex::new(InodeEntry {
+            object: LazyObject::new(root, odb.clone()),
+        }));
         state.inodes.write().unwrap()[ino] = Some(entry);
 
         Arc::new(state)
@@ -86,8 +92,8 @@ impl SharedState {
         inode.try_into().map_err(|_| InodeError::Invalid(inode))
     }
 
-    fn get_inode(&self, inode: u64) -> Result<SharedInodeEntry, InodeError> {
-        let entry = self
+    async fn get_inode(&self, inode: u64) -> Result<SharedInodeEntry, io::Error> {
+        let shared_entry = self
             .inodes
             .read()
             .unwrap() // assume the lock was not poisoned.
@@ -96,7 +102,27 @@ impl SharedState {
             .as_ref()
             .ok_or(InodeError::Invalid(inode))? // inode was deleted
             .clone();
-        Ok(entry)
+
+        let mut entry = shared_entry.lock().await;
+
+        // Check that the entry is valid.
+        match entry.object.get().await {
+            LazyObject::Error(e) => {
+                log::error!("get_inode: {e}");
+                return Err(eio());
+            }
+            LazyObject::Missing(oid) => {
+                log::error!("get_inode: inode {inode} refers to missing oid {oid}");
+                return Err(enoent());
+            }
+            LazyObject::Ok(o) => o,
+            LazyObject::Future(_, _) | LazyObject::Pending(_) => unreachable!(),
+        };
+
+        // TODO: It seems like we can't return a tokio MutexGuard like you can
+        // an ordinary sync mutex? The caller will have to re-lock.
+        drop(entry);
+        Ok(shared_entry)
     }
 }
 
@@ -119,6 +145,10 @@ impl FileSystem for DexFS {
 }
 
 fn eio() -> io::Error {
+    io::Error::from_raw_os_error(libc::EIO)
+}
+
+fn enoent() -> io::Error {
     io::Error::from_raw_os_error(libc::ENOENT)
 }
 
@@ -139,13 +169,8 @@ impl AsyncFileSystem for DexFS {
         inode: <Self as FileSystem>::Inode,
         _handle: Option<<Self as FileSystem>::Handle>,
     ) -> io::Result<(libc::stat64, Duration)> {
-        let entry = self.shared.get_inode(inode).log_if_error("get_inode")?;
-        let odb = self.shared.odb.clone();
-        let _object = entry
-            .get(odb)
-            .await
-            .log_if_error("while retrieving object")
-            .map_err(|_| eio())?;
+        let shared_entry = self.shared.get_inode(inode).await?;
+        let _entry = shared_entry.lock().await;
         unimplemented!()
     }
 
