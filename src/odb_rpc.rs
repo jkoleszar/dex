@@ -208,6 +208,7 @@ impl export::Server for Export {
 
                 log::debug!("waiting for objects to be sent");
                 done.send().promise.await?;
+                log::debug!("done.");
                 Ok(())
             })
         } else {
