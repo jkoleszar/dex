@@ -17,13 +17,33 @@ struct Tree {
         kind @0 :Kind;
         oid @1 :ObjectId;
         name @2 :Text;
+
+        # Stat
+        # st_dev omitted.
+        # st_ino omitted.
+        # st_nlink omitted. TODO: decide how to handle hard links.
+        stMode @3 :UInt32;
+        stUid @4 :UInt32;
+        stGid @5 :UInt32;
+        stRdev @6 :UInt64;
+        stSize @7 :UInt64;
+        # st_blksize omitted.
+        # st_blocks omitted.
+        # st_atime omitted.
+        # st_atime_nsec omitted.
+        stMtime @8 :UInt64;
+        stMtimeNsec @9 :UInt32;
+        stCtime @10 :UInt64;
+        stCtimeNsec @11 :UInt32;
     }
     entries @0 :List(Entry);
 }
 
 struct Object {
-    blob @0 :Data $Json.base64;
-    tree @1 :Tree;
+    union {
+        blob @0 :Data $Json.base64;
+        tree @1 :Tree;
+    }
 }
 
 interface Import {

@@ -133,7 +133,7 @@ impl Readthrough {
 
 /// A handle to a remote object that is fetched the first time it is accessed.
 pub enum LazyObject {
-    Future(ObjectId, mpsc::Sender<Request>),
+    Future(ObjectId),
     Pending(oneshot::Receiver<Response>),
     Missing(ObjectId),
     Error(Error),
@@ -141,13 +141,13 @@ pub enum LazyObject {
 }
 
 impl LazyObject {
-    pub fn new(oid: ObjectId, cache: mpsc::Sender<Request>) -> Self {
-        LazyObject::Future(oid, cache)
+    pub fn new(oid: ObjectId) -> Self {
+        LazyObject::Future(oid)
     }
 
-    pub async fn get(&mut self) -> &Self {
+    pub async fn get(&mut self, cache: &mpsc::Sender<Request>) -> &Self {
         match self {
-            LazyObject::Future(oid, cache) => {
+            LazyObject::Future(oid) => {
                 log::debug!("requesting oid {} from cache", &oid);
                 let (tx, rx) = oneshot::channel();
                 if cache

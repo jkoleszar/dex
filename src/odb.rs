@@ -1,4 +1,6 @@
 use std::fmt::{Debug, Display, Formatter};
+use std::mem::MaybeUninit;
+use std::num::TryFromIntError;
 
 use capnp::message::{ReaderSegments, TypedReader};
 use capnp::Word;
@@ -6,9 +8,10 @@ use hex;
 use ring::digest::{digest, SHA512_256};
 use rusqlite::{Connection, OptionalExtension};
 use thiserror::Error;
+use unwrap_infallible::UnwrapInfallible;
 
 use crate::capnp::LazyTypedReader;
-use crate::proto::odb_capnp::{object, object_id};
+use crate::proto::odb_capnp::{object, object_id, tree};
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub enum ObjectId {
@@ -138,5 +141,90 @@ impl<'a> ObjectDb<'a> {
     pub fn commit(&self) -> Result<(), Error> {
         self.conn.execute("COMMIT", ())?;
         Ok(())
+    }
+}
+
+// Popuplate a stat64 struct from a capnp Entry
+#[derive(Debug, Error)]
+pub enum StatFromEntryError {
+    #[error("{source} while decoding {context}")]
+    OutOfRange {
+        source: TryFromIntError,
+        context: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Stat {
+    FromObject(libc::stat64),
+    Root(libc::stat64),
+}
+impl Stat {
+    pub fn new_root() -> Stat {
+        use libc::*;
+        let mut stat = unsafe { MaybeUninit::<libc::stat64>::zeroed().assume_init() };
+        stat.st_ino = 1;
+        stat.st_nlink = 1;
+        stat.st_mode = S_IFDIR | S_IRWXU | (S_IRGRP | S_IXGRP) | (S_IROTH | S_IXOTH);
+        Stat::Root(stat)
+    }
+}
+impl<'a> From<Stat> for libc::stat64 {
+    fn from(value: Stat) -> Self {
+        match value {
+            Stat::FromObject(s) => s,
+            Stat::Root(s) => s,
+        }
+    }
+}
+
+impl<'a> TryFrom<tree::entry::Reader<'a>> for Stat {
+    type Error = StatFromEntryError;
+
+    fn try_from(entry: tree::entry::Reader<'a>) -> Result<Stat, StatFromEntryError> {
+        // SAFETY: Unfortunately, we can't use a struct initializer here because of
+        // some private padding fields. Applications are expected to zero this
+        // structure according to the ABI.
+        let mut stat = unsafe { MaybeUninit::<libc::stat64>::zeroed().assume_init() };
+        stat.st_dev = 0;
+        stat.st_mode = entry.get_st_mode();
+        stat.st_uid = entry.get_st_uid();
+        stat.st_gid = entry.get_st_gid();
+        stat.st_rdev = entry.get_st_rdev();
+        stat.st_size =
+            entry
+                .get_st_size()
+                .try_into()
+                .map_err(|e| StatFromEntryError::OutOfRange {
+                    source: e,
+                    context: "st_size".to_string(),
+                })?;
+        stat.st_blksize = 4096;
+        stat.st_blocks = (stat.st_size + 511) / 512;
+        stat.st_mtime =
+            entry
+                .get_st_mtime()
+                .try_into()
+                .map_err(|e| StatFromEntryError::OutOfRange {
+                    source: e,
+                    context: "st_mtime".to_string(),
+                })?;
+        stat.st_mtime_nsec = entry.get_st_mtime_nsec().try_into().unwrap_infallible();
+        stat.st_ctime =
+            entry
+                .get_st_ctime()
+                .try_into()
+                .map_err(|e| StatFromEntryError::OutOfRange {
+                    source: e,
+                    context: "st_ctime".to_string(),
+                })?;
+        stat.st_ctime_nsec = entry.get_st_ctime_nsec().try_into().unwrap_infallible();
+        stat.st_atime = stat.st_mtime;
+        stat.st_atime_nsec = stat.st_mtime_nsec;
+
+        // The following fields remain unset:
+        // stat.st_ino
+        // stat.st_nlink
+        Ok(Stat::FromObject(stat))
     }
 }

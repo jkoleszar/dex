@@ -25,6 +25,7 @@ thiserror = "1.0.39"
 tokio = { version = "1.26.0", features = ["net", "rt", "rt-multi-thread", "macros", "io-util", "signal", "tracing"] }
 tokio-rusqlite = "0.3.0"
 tokio-util = { version = "0.7.7", features = ["compat"] }
+unwrap-infallible = "0.1.5"
 
 [build-dependencies]
 capnpc = "0.16.3"
