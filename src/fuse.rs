@@ -9,7 +9,8 @@ use anyhow::{anyhow, bail, Context as AnyhowContext, Result};
 use async_trait::async_trait;
 use fuse_backend_rs::abi::fuse_abi::{CreateIn, OpenOptions, SetattrValid};
 use fuse_backend_rs::api::filesystem::{
-    AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, Entry, FileSystem,
+    AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, DirEntry, Entry,
+    FileSystem, FsOptions,
 };
 use fuse_backend_rs::transport::{FuseChannel, FuseSession};
 use libc::{EIO, ENOENT};
@@ -46,6 +47,8 @@ struct InodeEntry {
     object: AsyncMutex<LazyObject>,
     parent_inode: u64,
     stat: libc::stat64,
+    filename: String,
+    children: Vec<usize>,
 }
 
 type SharedInodeEntry = Arc<InodeEntry>;
@@ -80,13 +83,6 @@ impl InodeTable {
         let mut vec = self.0.write().unwrap();
         let ino = vec.len();
         vec.push(None);
-        ino
-    }
-
-    fn insert(&self, entry: InodeEntry) -> usize {
-        let mut vec = self.0.write().unwrap();
-        let ino = vec.len();
-        vec.push(Some(Arc::new(entry)));
         ino
     }
 
@@ -152,13 +148,19 @@ impl SharedState {
         self.inodes.alloc();
 
         // inode 1 is the root object
-        self.inodes.insert(InodeEntry {
-            oid: root.clone(),
-            object: lazy_object.into(),
-            parent_inode: 0,
-            stat: stat,
-        });
-        self.populate_tree(tree, 1)?;
+        self.inodes.alloc();
+        let children = self.populate_tree(tree, 1)?;
+        self.inodes.replace(
+            1,
+            InodeEntry {
+                oid: root.clone(),
+                object: lazy_object.into(),
+                parent_inode: 0,
+                stat: stat,
+                filename: ".".to_string(),
+                children,
+            },
+        );
 
         Ok(())
     }
@@ -190,6 +192,8 @@ impl SharedState {
                         object: LazyObject::new(oid).into(),
                         parent_inode: parent,
                         stat,
+                        filename: entry.get_name()?.to_string(),
+                        children: Vec::new(),
                     },
                 );
                 Ok(idx)
@@ -257,11 +261,6 @@ impl DexFS {
 
 type FuseServer = fuse_backend_rs::api::server::Server<DexFS>;
 
-impl FileSystem for DexFS {
-    type Inode = u64;
-    type Handle = u64;
-}
-
 /// An error that will be returned to the FileSystem/end user.
 ///
 /// This lets us distinguish between an unexpected io::Error that was
@@ -304,6 +303,72 @@ impl From<anyhow::Error> for FuseError {
     }
 }
 
+fn mode_to_dirtype(st_mode: u32) -> u32 {
+    // IFTODT (((mode) & 0170000) >> 12)
+    ((st_mode) & 0o170000) >> 12
+}
+
+impl FileSystem for DexFS {
+    type Inode = u64;
+    type Handle = u64;
+
+    fn init(&self, mut capable: FsOptions) -> Result<FsOptions, io::Error> {
+        // Request READDIRPLUS only.
+        capable |= FsOptions::DO_READDIRPLUS;
+        capable &= !FsOptions::READDIRPLUS_AUTO;
+        Ok(capable)
+    }
+
+    fn readdirplus(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        _handle: Self::Handle,
+        _size: u32,
+        offset: u64,
+        add_entry: &mut dyn FnMut(DirEntry<'_>, Entry) -> Result<usize, io::Error>,
+    ) -> Result<(), io::Error> {
+        let inode_entry = self.shared.inodes.get(inode).map_err(FuseError::from)?;
+        for (i, child_inode) in inode_entry
+            .children
+            .iter()
+            .enumerate()
+            .skip(offset.try_into().unwrap())
+        {
+            let child = self
+                .shared
+                .inodes
+                .get(*child_inode as u64)
+                .map_err(FuseError::from)?;
+            // NB: The 'offset' to return here is opaque to the kernel. It acts as
+            // a continuation cookie to get the *next* element in the sequence.
+            // Since we have all the entries in a static list, we can just use the
+            // list index directly, making sure to preincrement, or we'll end up
+            // in an infinite loop.
+            let dirent = DirEntry {
+                ino: *child_inode as u64,
+                offset: (i + 1) as u64,
+                name: child.filename.as_bytes(),
+                type_: mode_to_dirtype(child.stat.st_mode),
+            };
+            let ent = Entry {
+                inode: *child_inode as u64,
+                generation: 0,
+                attr: child.stat,
+                attr_flags: 0,
+                attr_timeout: TTL,
+                entry_timeout: TTL,
+            };
+            log::trace!(
+                "adding child {} ({i} of {}) offset {offset}",
+                child.filename,
+                inode_entry.children.len()
+            );
+            add_entry(dirent, ent)?;
+        }
+        Ok(())
+    }
+}
 #[async_trait]
 impl AsyncFileSystem for DexFS {
     async fn async_lookup(
