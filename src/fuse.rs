@@ -20,7 +20,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::odb::{ObjectId, Stat};
+use crate::odb::{ObjectId, StatWithUnknownInode};
 use crate::odb_readthrough;
 use crate::odb_readthrough::LazyObject;
 use crate::proto::odb_capnp::{object, tree};
@@ -45,22 +45,7 @@ struct InodeEntry {
     oid: ObjectId,
     object: LazyObject,
     parent_inode: u64,
-    stat: Option<Stat>,
-}
-
-// Populate an InodeEntry from a capnp message.
-impl<'a> TryFrom<tree::entry::Reader<'a>> for InodeEntry {
-    type Error = anyhow::Error;
-
-    fn try_from(entry: tree::entry::Reader<'a>) -> Result<InodeEntry, anyhow::Error> {
-        let oid: ObjectId = entry.get_oid()?.try_into()?;
-        Ok(InodeEntry {
-            oid: oid.clone(),
-            object: LazyObject::new(oid),
-            parent_inode: 0,
-            stat: Some(entry.clone().try_into()?),
-        })
-    }
+    stat: Option<libc::stat64>,
 }
 
 type SharedInodeEntry = Arc<AsyncMutex<InodeEntry>>;
@@ -89,18 +74,34 @@ impl SharedState {
             oid: root.clone(),
             object: LazyObject::new(root),
             parent_inode: 0,
-            stat: Some(Stat::new_root()),
+            stat: None,
         };
-        Self::alloc_inode(&state.inodes, entry);
+        Self::insert_inode(&state.inodes, entry);
 
         Arc::new(state)
     }
 
-    fn alloc_inode(inodes: &RwLock<Vec<Option<SharedInodeEntry>>>, entry: InodeEntry) -> usize {
+    fn alloc_inode(inodes: &RwLock<Vec<Option<SharedInodeEntry>>>) -> usize {
+        let mut vec = inodes.write().unwrap();
+        let ino = vec.len();
+        vec.push(None);
+        ino
+    }
+
+    fn insert_inode(inodes: &RwLock<Vec<Option<SharedInodeEntry>>>, entry: InodeEntry) -> usize {
         let mut vec = inodes.write().unwrap();
         let ino = vec.len();
         vec.push(Some(Arc::new(AsyncMutex::new(entry))));
         ino
+    }
+
+    fn replace_inode(
+        inodes: &RwLock<Vec<Option<SharedInodeEntry>>>,
+        index: usize,
+        entry: InodeEntry,
+    ) {
+        let mut vec = inodes.write().unwrap();
+        vec[index] = Some(Arc::new(AsyncMutex::new(entry)));
     }
 
     fn inode_index(inode: u64) -> Result<usize, anyhow::Error> {
@@ -119,9 +120,28 @@ impl SharedState {
             .get_entries()?
             .iter()
             .map(|entry| {
-                let mut new_entry: InodeEntry = entry.try_into()?;
-                new_entry.parent_inode = parent;
-                Ok(Self::alloc_inode(inodes, new_entry))
+                let idx = Self::alloc_inode(inodes);
+
+                // Finalize entry based on our now-known inode number
+                // TODO: decide how to handle hard links
+                let oid: ObjectId = entry.get_oid()?.try_into()?;
+
+                if !entry.has_stat() {
+                    return Err(anyhow!("entry {oid} missing stat data"));
+                }
+                let stat = StatWithUnknownInode::try_from(entry.get_stat()?)?.finalize(idx as u64);
+
+                Self::replace_inode(
+                    inodes,
+                    idx,
+                    InodeEntry {
+                        oid: oid.clone(),
+                        object: LazyObject::new(oid),
+                        parent_inode: parent,
+                        stat: Some(stat),
+                    },
+                );
+                Ok(idx)
             })
             .collect();
         Ok(entries?)
@@ -158,8 +178,8 @@ impl SharedState {
 
         // Populate our child inodes if necessary.
         if !initially_ok {
-            if let object::Tree(tree) = object
-                .reader()
+            let reader = object.reader();
+            let which = reader
                 .get()
                 .map_err(|e| {
                     anyhow::Error::from(e)
@@ -171,8 +191,22 @@ impl SharedState {
                         "unknown object type at ino {inode} oid {}",
                         entry.oid
                     ))
-                })?
-            {
+                })?;
+
+            // Extract stat for tree root.
+            let tree = match which {
+                object::TreeRoot(root) => {
+                    let stat =
+                        StatWithUnknownInode::try_from(root.clone()?.get_stat()?)?.finalize(inode);
+                    entry.stat = Some(stat);
+                    Some(root?.get_tree())
+                }
+                object::Tree(tree) => Some(tree),
+                _ => None,
+            };
+
+            // Populate tree entries.
+            if let Some(tree) = tree {
                 tree.map_err(anyhow::Error::from)
                     .and_then(|tree| Ok(self.populate_tree(tree, entry.parent_inode)?))
                     .map_err(|e| {

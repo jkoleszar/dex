@@ -11,7 +11,7 @@ use thiserror::Error;
 use unwrap_infallible::UnwrapInfallible;
 
 use crate::capnp::LazyTypedReader;
-use crate::proto::odb_capnp::{object, object_id, tree};
+use crate::proto::odb_capnp::{object, object_id, stat};
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub enum ObjectId {
@@ -146,56 +146,64 @@ impl<'a> ObjectDb<'a> {
 
 // Popuplate a stat64 struct from a capnp Entry
 #[derive(Debug, Error)]
-pub enum StatFromEntryError {
+pub enum StatFromCapnpError {
     #[error("{source} while decoding {context}")]
     OutOfRange {
         source: TryFromIntError,
         context: String,
     },
+    #[error("schema violation: {0}")]
+    NotInSchema(#[from] capnp::NotInSchema),
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum Stat {
-    FromObject(libc::stat64),
-    Root(libc::stat64),
-}
-impl Stat {
-    pub fn new_root() -> Stat {
-        use libc::*;
-        let mut stat = unsafe { MaybeUninit::<libc::stat64>::zeroed().assume_init() };
-        stat.st_ino = 1;
-        stat.st_nlink = 1;
-        stat.st_mode = S_IFDIR | S_IRWXU | (S_IRGRP | S_IXGRP) | (S_IROTH | S_IXOTH);
-        Stat::Root(stat)
-    }
-}
-impl<'a> From<Stat> for libc::stat64 {
-    fn from(value: Stat) -> Self {
-        match value {
-            Stat::FromObject(s) => s,
-            Stat::Root(s) => s,
-        }
+pub struct StatWithUnknownInode(libc::stat64);
+
+impl StatWithUnknownInode {
+    pub fn finalize(mut self, inode: u64) -> libc::stat64 {
+        self.0.st_ino = inode;
+        self.0
     }
 }
 
-impl<'a> TryFrom<tree::entry::Reader<'a>> for Stat {
-    type Error = StatFromEntryError;
+#[cfg(target_os = "linux")]
+const MINORBITS: usize = 20;
 
-    fn try_from(entry: tree::entry::Reader<'a>) -> Result<Stat, StatFromEntryError> {
+#[cfg(target_os = "linux")]
+pub fn mkdev(major: u64, minor: u64) -> libc::dev_t {
+    (major << MINORBITS) | minor
+}
+
+impl<'a> TryFrom<stat::Reader<'a>> for StatWithUnknownInode {
+    type Error = StatFromCapnpError;
+
+    fn try_from(entry: stat::Reader<'a>) -> Result<StatWithUnknownInode, StatFromCapnpError> {
         // SAFETY: Unfortunately, we can't use a struct initializer here because of
         // some private padding fields. Applications are expected to zero this
         // structure according to the ABI.
         let mut stat = unsafe { MaybeUninit::<libc::stat64>::zeroed().assume_init() };
         stat.st_dev = 0;
-        stat.st_mode = entry.get_st_mode();
+        stat.st_nlink = std::cmp::min(1, entry.get_st_nlink());
+
+        stat.st_mode = entry.get_st_mode()
+            | match entry.get_kind()? {
+                stat::Kind::Block => libc::S_IFBLK,
+                stat::Kind::Char => libc::S_IFCHR,
+                stat::Kind::Fifo => libc::S_IFIFO,
+                stat::Kind::Regular => libc::S_IFREG,
+                stat::Kind::Dir => libc::S_IFDIR,
+                stat::Kind::Symlink => libc::S_IFLNK,
+            };
         stat.st_uid = entry.get_st_uid();
         stat.st_gid = entry.get_st_gid();
-        stat.st_rdev = entry.get_st_rdev();
+        stat.st_rdev = mkdev(
+            entry.get_device_major().into(),
+            entry.get_device_minor().into(),
+        );
         stat.st_size =
             entry
                 .get_st_size()
                 .try_into()
-                .map_err(|e| StatFromEntryError::OutOfRange {
+                .map_err(|e| StatFromCapnpError::OutOfRange {
                     source: e,
                     context: "st_size".to_string(),
                 })?;
@@ -205,7 +213,7 @@ impl<'a> TryFrom<tree::entry::Reader<'a>> for Stat {
             entry
                 .get_st_mtime()
                 .try_into()
-                .map_err(|e| StatFromEntryError::OutOfRange {
+                .map_err(|e| StatFromCapnpError::OutOfRange {
                     source: e,
                     context: "st_mtime".to_string(),
                 })?;
@@ -214,7 +222,7 @@ impl<'a> TryFrom<tree::entry::Reader<'a>> for Stat {
             entry
                 .get_st_ctime()
                 .try_into()
-                .map_err(|e| StatFromEntryError::OutOfRange {
+                .map_err(|e| StatFromCapnpError::OutOfRange {
                     source: e,
                     context: "st_ctime".to_string(),
                 })?;
@@ -225,6 +233,6 @@ impl<'a> TryFrom<tree::entry::Reader<'a>> for Stat {
         // The following fields remain unset:
         // stat.st_ino
         // stat.st_nlink
-        Ok(Stat::FromObject(stat))
+        Ok(StatWithUnknownInode(stat))
     }
 }

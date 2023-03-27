@@ -6,43 +6,51 @@ struct ObjectId {
     id @0 :Data $Json.hex;
 }
 
+struct Stat {
+    enum Kind {
+        block @0;
+        char @1;
+        fifo @2;
+        regular @3;
+        dir @4;
+        symlink @5;
+    }
+    kind @0 :Kind;
+    # st_dev omitted.
+    # st_ino omitted.
+    stMode @1 :UInt32;
+    stNlink @2 :UInt64;
+    stUid @3 :UInt32;
+    stGid @4 :UInt32;
+    deviceMajor @5 :UInt32;
+    deviceMinor @6 :UInt32;
+    stSize @7 :UInt64;
+    # st_blksize omitted.
+    # st_blocks omitted.
+    # st_atime omitted.
+    # st_atime_nsec omitted.
+    stMtime @8 :UInt64;
+    stMtimeNsec @9 :UInt32;
+    stCtime @10 :UInt64;
+    stCtimeNsec @11 :UInt32;
+}
 struct Tree {
     struct Entry {
-        enum Kind {
-            dir @0;
-            file @1;
-            symlink @2;
-        }
-
-        kind @0 :Kind;
-        oid @1 :ObjectId;
-        name @2 :Text;
-
-        # Stat
-        # st_dev omitted.
-        # st_ino omitted.
-        # st_nlink omitted. TODO: decide how to handle hard links.
-        stMode @3 :UInt32;
-        stUid @4 :UInt32;
-        stGid @5 :UInt32;
-        stRdev @6 :UInt64;
-        stSize @7 :UInt64;
-        # st_blksize omitted.
-        # st_blocks omitted.
-        # st_atime omitted.
-        # st_atime_nsec omitted.
-        stMtime @8 :UInt64;
-        stMtimeNsec @9 :UInt32;
-        stCtime @10 :UInt64;
-        stCtimeNsec @11 :UInt32;
+        oid @0 :ObjectId;
+        name @1 :Text;
+        stat @2 :Stat;
     }
     entries @0 :List(Entry);
 }
-
+struct TreeRoot {
+    tree @0 :Tree;
+    stat @1 :Stat;
+}
 struct Object {
     union {
         blob @0 :Data $Json.base64;
         tree @1 :Tree;
+        treeRoot @2 :TreeRoot;
     }
 }
 
