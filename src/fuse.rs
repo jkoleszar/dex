@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context as AnyhowContext};
+use anyhow::{anyhow, Context as AnyhowContext, Result};
 use async_trait::async_trait;
 use fuse_backend_rs::abi::fuse_abi::{CreateIn, OpenOptions, SetattrValid};
 use fuse_backend_rs::api::filesystem::{
@@ -50,24 +50,73 @@ struct InodeEntry {
 
 type SharedInodeEntry = Arc<AsyncMutex<InodeEntry>>;
 
+struct InodeTable(RwLock<Vec<Option<SharedInodeEntry>>>);
+impl InodeTable {
+    fn new() -> Self {
+        InodeTable(Vec::new().into())
+    }
+
+    fn index(inode: u64) -> Result<usize, anyhow::Error> {
+        inode
+            .try_into()
+            .map_err(|_| InodeError::Invalid(inode).into())
+    }
+
+    fn get(&self, inode: u64) -> Result<SharedInodeEntry> {
+        Ok(self.0
+            .read()
+            .unwrap() // assume the lock was not poisoned.
+            .get(Self::index(inode)?)
+            .ok_or(InodeError::Invalid(inode))
+            .context("inode was never allocated")?
+            .as_ref()
+            .ok_or(InodeError::Invalid(inode))
+            .context("inode was deleted")?
+            .clone())
+    }
+
+    fn alloc(&self) -> usize {
+        let mut vec = self.0.write().unwrap();
+        let ino = vec.len();
+        vec.push(None);
+        ino
+    }
+
+    fn insert(&self, entry: InodeEntry) -> usize {
+        let mut vec = self.0.write().unwrap();
+        let ino = vec.len();
+        vec.push(Some(Arc::new(AsyncMutex::new(entry))));
+        ino
+    }
+
+    fn replace(
+        &self,
+        index: usize,
+        entry: InodeEntry,
+    ) {
+        let mut vec = self.0.write().unwrap();
+        vec[index] = Some(Arc::new(AsyncMutex::new(entry)));
+    }
+}
+
 /// DexFS state shared across all workers
 struct SharedState {
     /// Connection to object database
     odb: mpsc::Sender<odb_readthrough::Request>,
 
     /// Indexed by inode
-    inodes: RwLock<Vec<Option<SharedInodeEntry>>>,
+    inodes: InodeTable,
 }
 
 impl SharedState {
     fn new(odb: mpsc::Sender<odb_readthrough::Request>, root: ObjectId) -> Arc<SharedState> {
         let state = SharedState {
             odb: odb.clone(),
-            inodes: Vec::new().into(),
+            inodes: InodeTable::new(),
         };
 
         // inode 0 is unused
-        state.inodes.write().unwrap().push(None);
+        state.inodes.alloc();
 
         // inode 1 is the root object
         let entry = InodeEntry {
@@ -76,38 +125,9 @@ impl SharedState {
             parent_inode: 0,
             stat: None,
         };
-        Self::insert_inode(&state.inodes, entry);
+        state.inodes.insert(entry);
 
         Arc::new(state)
-    }
-
-    fn alloc_inode(inodes: &RwLock<Vec<Option<SharedInodeEntry>>>) -> usize {
-        let mut vec = inodes.write().unwrap();
-        let ino = vec.len();
-        vec.push(None);
-        ino
-    }
-
-    fn insert_inode(inodes: &RwLock<Vec<Option<SharedInodeEntry>>>, entry: InodeEntry) -> usize {
-        let mut vec = inodes.write().unwrap();
-        let ino = vec.len();
-        vec.push(Some(Arc::new(AsyncMutex::new(entry))));
-        ino
-    }
-
-    fn replace_inode(
-        inodes: &RwLock<Vec<Option<SharedInodeEntry>>>,
-        index: usize,
-        entry: InodeEntry,
-    ) {
-        let mut vec = inodes.write().unwrap();
-        vec[index] = Some(Arc::new(AsyncMutex::new(entry)));
-    }
-
-    fn inode_index(inode: u64) -> Result<usize, anyhow::Error> {
-        inode
-            .try_into()
-            .map_err(|_| InodeError::Invalid(inode).into())
     }
 
     fn populate_tree<'a>(
@@ -115,12 +135,11 @@ impl SharedState {
         tree: tree::Reader<'a>,
         parent: u64,
     ) -> Result<Vec<usize>, anyhow::Error> {
-        let inodes = &self.inodes;
         let entries: Result<Vec<usize>, anyhow::Error> = tree
             .get_entries()?
             .iter()
             .map(|entry| {
-                let idx = Self::alloc_inode(inodes);
+                let idx = self.inodes.alloc();
 
                 // Finalize entry based on our now-known inode number
                 // TODO: decide how to handle hard links
@@ -131,8 +150,7 @@ impl SharedState {
                 }
                 let stat = StatWithUnknownInode::try_from(entry.get_stat()?)?.finalize(idx as u64);
 
-                Self::replace_inode(
-                    inodes,
+                self.inodes.replace(
                     idx,
                     InodeEntry {
                         oid: oid.clone(),
@@ -148,17 +166,7 @@ impl SharedState {
     }
 
     async fn get_inode(&self, inode: u64) -> Result<SharedInodeEntry, anyhow::Error> {
-        let shared_entry = self
-            .inodes
-            .read()
-            .unwrap() // assume the lock was not poisoned.
-            .get(Self::inode_index(inode)?)
-            .ok_or(InodeError::Invalid(inode))
-            .context("inode was never allocated")?
-            .as_ref()
-            .ok_or(InodeError::Invalid(inode))
-            .context("inode was deleted")?
-            .clone();
+        let shared_entry = self.inodes.get(inode)?;
 
         let mut entry = shared_entry.lock().await;
 
