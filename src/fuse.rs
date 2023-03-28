@@ -51,6 +51,19 @@ struct InodeEntry {
     children: Vec<usize>,
 }
 
+impl InodeEntry {
+    fn fuse_entry(&self, inode: u64) -> Entry {
+        Entry {
+            inode: inode,
+            generation: 0,
+            attr: self.stat,
+            attr_flags: 0,
+            attr_timeout: TTL,
+            entry_timeout: TTL,
+        }
+    }
+}
+
 type SharedInodeEntry = Arc<InodeEntry>;
 
 struct InodeTable(RwLock<Vec<Option<SharedInodeEntry>>>);
@@ -328,45 +341,38 @@ impl FileSystem for DexFS {
         offset: u64,
         add_entry: &mut dyn FnMut(DirEntry<'_>, Entry) -> Result<usize, io::Error>,
     ) -> Result<(), io::Error> {
-        let inode_entry = self.shared.inodes.get(inode).map_err(FuseError::from)?;
-        for (i, child_inode) in inode_entry
-            .children
-            .iter()
-            .enumerate()
-            .skip(offset.try_into().unwrap())
-        {
-            let child = self
-                .shared
-                .inodes
-                .get(*child_inode as u64)
-                .map_err(FuseError::from)?;
-            // NB: The 'offset' to return here is opaque to the kernel. It acts as
-            // a continuation cookie to get the *next* element in the sequence.
-            // Since we have all the entries in a static list, we can just use the
-            // list index directly, making sure to preincrement, or we'll end up
-            // in an infinite loop.
-            let dirent = DirEntry {
-                ino: *child_inode as u64,
-                offset: (i + 1) as u64,
-                name: child.filename.as_bytes(),
-                type_: mode_to_dirtype(child.stat.st_mode),
-            };
-            let ent = Entry {
-                inode: *child_inode as u64,
-                generation: 0,
-                attr: child.stat,
-                attr_flags: 0,
-                attr_timeout: TTL,
-                entry_timeout: TTL,
-            };
-            log::trace!(
-                "adding child {} ({i} of {}) offset {offset}",
-                child.filename,
-                inode_entry.children.len()
-            );
-            add_entry(dirent, ent)?;
-        }
-        Ok(())
+        || -> Result<(), anyhow::Error> {
+            let inode_entry = self.shared.inodes.get(inode)?;
+            for (i, child_inode) in inode_entry
+                .children
+                .iter()
+                .enumerate()
+                .skip(offset.try_into().unwrap())
+            {
+                let child = self.shared.inodes.get(*child_inode as u64)?;
+                // NB: The 'offset' to return here is opaque to the kernel. It acts as
+                // a continuation cookie to get the *next* element in the sequence.
+                // Since we have all the entries in a static list, we can just use the
+                // list index directly, making sure to preincrement, or we'll end up
+                // in an infinite loop.
+                let dirent = DirEntry {
+                    ino: *child_inode as u64,
+                    offset: (i + 1) as u64,
+                    name: child.filename.as_bytes(),
+                    type_: mode_to_dirtype(child.stat.st_mode),
+                };
+                log::trace!(
+                    "adding child {} ({i} of {}) offset {offset}",
+                    child.filename,
+                    inode_entry.children.len()
+                );
+                add_entry(dirent, child.fuse_entry(*child_inode as u64))?;
+            }
+            Ok(())
+        }()
+        .context("readdirplus")
+        .map_err(FuseError::from)
+        .map_err(io::Error::from)
     }
 }
 #[async_trait]
