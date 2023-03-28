@@ -90,8 +90,9 @@ impl import::Server for OneshotImport {
             // Must copy the sub-message out of its container in order to write
             // it to the database.
             // TODO: remove this copy.
+            // TODO: why doesn't set_root_canonical work?
             let mut out = ::capnp::message::Builder::new_default();
-            pry!(out.set_root_canonical(object));
+            pry!(out.set_root(object));
 
             let db = db.clone();
             let rc = Rc::clone(&self.state.borrow().oids);

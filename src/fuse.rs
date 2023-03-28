@@ -48,7 +48,7 @@ struct InodeEntry {
     parent_inode: u64,
     stat: libc::stat64,
     filename: String,
-    children: Vec<usize>,
+    children: RwLock<Vec<usize>>,
 }
 
 impl InodeEntry {
@@ -78,28 +78,32 @@ impl InodeTable {
             .map_err(|_| InodeError::Invalid(inode).into())
     }
 
-    fn get(&self, inode: u64) -> Result<SharedInodeEntry> {
-        Ok(self
-            .0
-            .read()
-            .unwrap() // assume the lock was not poisoned.
+    /// Gets the raw inode as it exists in the map. This is likely not what
+    /// you want. Use get_inode() instead.
+    fn get_internal(&self, inode: u64) -> Result<SharedInodeEntry> {
+        // assume the lock was not poisoned.
+        let vec = self.0.read().unwrap();
+        let maybe_entry = vec
             .get(Self::index(inode)?)
             .ok_or(InodeError::Invalid(inode))
-            .context("inode was never allocated")?
+            .context("InodeTable: inode was never allocated")?;
+        let entry = maybe_entry
             .as_ref()
             .ok_or(InodeError::Invalid(inode))
-            .context("inode was deleted")?
-            .clone())
+            .context("InodeTable: inode was deleted")?;
+        Ok(entry.clone())
     }
 
     fn alloc(&self) -> usize {
         let mut vec = self.0.write().unwrap();
+        log::trace!("InodeTable: allocating inode {}", vec.len());
         let ino = vec.len();
         vec.push(None);
         ino
     }
 
     fn replace(&self, index: usize, entry: InodeEntry) {
+        log::trace!("InodeTable: replacing inode {index}");
         let mut vec = self.0.write().unwrap();
         vec[index] = Some(Arc::new(entry));
     }
@@ -171,7 +175,7 @@ impl SharedState {
                 parent_inode: 0,
                 stat: stat,
                 filename: ".".to_string(),
-                children,
+                children: children.into(),
             },
         );
 
@@ -206,7 +210,7 @@ impl SharedState {
                         parent_inode: parent,
                         stat,
                         filename: entry.get_name()?.to_string(),
-                        children: Vec::new(),
+                        children: Vec::new().into(),
                     },
                 );
                 Ok(idx)
@@ -217,7 +221,7 @@ impl SharedState {
 
     async fn get_inode(&self, inode: u64) -> Result<SharedInodeEntry, anyhow::Error> {
         use std::ops::Deref;
-        let entry = self.inodes.get(inode)?;
+        let entry = self.inodes.get_internal(inode)?;
 
         let mut object_lock = entry.object.lock().await;
 
@@ -245,11 +249,23 @@ impl SharedState {
                 object::Tree(tree) => Some(tree),
                 _ => None,
             } {
+                log::trace!("get_inode({inode}) populate tree");
                 tree.map_err(anyhow::Error::from)
-                    .and_then(|tree| Ok(self.populate_tree(tree, entry.parent_inode)?))
                     .map_err(|e| {
                         anyhow::Error::from(e)
                             .context(format!("corrupt tree at ino {inode} oid {}", entry.oid))
+                    })
+                    .and_then(|tree| Ok(self.populate_tree(tree, entry.parent_inode)?))
+                    .and_then(|new_children| {
+                        let mut children = entry.children.write().unwrap();
+                        children.truncate(0);
+                        children.extend(new_children.into_iter());
+                        log::trace!(
+                            "get_inode({inode}) {} now has {} children",
+                            entry.filename,
+                            children.len()
+                        );
+                        Ok(())
                     })?;
             }
         }
@@ -325,11 +341,11 @@ impl FileSystem for DexFS {
     type Inode = u64;
     type Handle = u64;
 
-    fn init(&self, mut capable: FsOptions) -> Result<FsOptions, io::Error> {
-        // Request READDIRPLUS only.
-        capable |= FsOptions::DO_READDIRPLUS;
-        capable &= !FsOptions::READDIRPLUS_AUTO;
-        Ok(capable)
+    fn init(&self, _capable: FsOptions) -> Result<FsOptions, io::Error> {
+        let mut options = FsOptions::empty();
+        // Request READDIRPLUS only (no READDIRPLUS_AUTO).
+        options |= FsOptions::DO_READDIRPLUS;
+        Ok(options)
     }
 
     fn readdirplus(
@@ -341,15 +357,24 @@ impl FileSystem for DexFS {
         offset: u64,
         add_entry: &mut dyn FnMut(DirEntry<'_>, Entry) -> Result<usize, io::Error>,
     ) -> Result<(), io::Error> {
+        log::trace!("readdirplus({inode}, {offset})");
         || -> Result<(), anyhow::Error> {
-            let inode_entry = self.shared.inodes.get(inode)?;
+            // Look up inode. We must use the raw get_internal accessor because we
+            // are not in an async context.
+            let inode_entry = self.shared.inodes.get_internal(inode)?;
+            log::trace!(
+                "readdirplus({inode}, {offset}): {} children",
+                inode_entry.children.read().unwrap().len()
+            );
             for (i, child_inode) in inode_entry
                 .children
+                .read()
+                .unwrap()
                 .iter()
                 .enumerate()
                 .skip(offset.try_into().unwrap())
             {
-                let child = self.shared.inodes.get(*child_inode as u64)?;
+                let child = self.shared.inodes.get_internal(*child_inode as u64)?;
                 // NB: The 'offset' to return here is opaque to the kernel. It acts as
                 // a continuation cookie to get the *next* element in the sequence.
                 // Since we have all the entries in a static list, we can just use the
@@ -364,7 +389,7 @@ impl FileSystem for DexFS {
                 log::trace!(
                     "adding child {} ({i} of {}) offset {offset}",
                     child.filename,
-                    inode_entry.children.len()
+                    inode_entry.children.read().unwrap().len()
                 );
                 add_entry(dirent, child.fuse_entry(*child_inode as u64))?;
             }
@@ -380,10 +405,50 @@ impl AsyncFileSystem for DexFS {
     async fn async_lookup(
         &self,
         _ctx: &Context,
-        _parent: <Self as FileSystem>::Inode,
-        _name: &CStr,
+        parent: <Self as FileSystem>::Inode,
+        name: &CStr,
     ) -> io::Result<Entry> {
-        unimplemented!()
+        let error_context = format!("async_lookup({parent}, {name:?})");
+        log::trace!("{error_context}");
+        let name = name
+            .to_str()
+            .map_err(anyhow::Error::from)
+            .map_err(FuseError::from)?
+            .to_string();
+        let inode = self
+            .shared
+            .get_inode(parent)
+            .await
+            .map_err(FuseError::from)?;
+        let child_index = {
+            let key = Ok(name);
+            inode.children.read().unwrap().binary_search_by_key(&key, |&child_ino| {
+                // We are not in an async context, and thus can not use get_inode().
+                // Use the get_internal accessor instead. This means that the children's
+                // children are not sure to be set, but we're not accessing them here.
+                self.shared.inodes.get_internal(child_ino.try_into().unwrap())
+                    .map(|i| i.filename.clone())
+                    .map_err(|e| {
+                        // There's no way to propagate this error, it will just be
+                        // consumed by the caller as the entry not being found
+                        // in the map. If we got here, we did so via inode, which
+                        // should have been valid, and the table lookup failing
+                        // should never happen.
+                        log::error!("async_lookup: failed to get inode {child_ino} as a child of {parent}: {e}");
+                    })
+            }).map_err(|_|FuseError::new(ENOENT))
+        }?;
+
+        // Fetch the child entry. This will create inodes for its children as well.
+        let child_inode = *&inode.children.read().unwrap()[child_index];
+        let child_entry = self
+            .shared
+            .get_inode(child_inode as u64)
+            .await
+            .context(error_context)
+            .map_err(FuseError::from)?;
+
+        Ok(child_entry.fuse_entry((child_inode).try_into().unwrap()))
     }
 
     async fn async_getattr(
